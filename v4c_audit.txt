@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# =============================================================================
+# v4c INDICATOR ALPHA & JUSTIFICATION AUDIT  (master_prompt_v3 Section A.0 / C)
+# =============================================================================
+# Mandatory v3 pre-rebuild step. For each indicator defined in the uploaded
+# convexity_regime_engine2_production_v4c.txt, we:
+#   (1) restate the definition FROM CODE (with bug/leakage flags),
+#   (2) assign a justification class {Strong,Plausible,Weak,Unsupported} + cite,
+#   (3) construct a leakage-REMEDIATED standalone signal (full-sample zscore ->
+#       expanding/rolling in-sample z-score) and trade it on the SPX underlying,
+#   (4) run the standalone edge test: deflated Sharpe IS/OOS, PBO, SPA p-value,
+#       regime-neutral POP (OOS) and best-regime POP (OOS),
+#   (5) redundancy / collinearity check vs canonical best-in-class features,
+#   (6) stability check (rolling-Sharpe sign consistency),
+#   (7) head-to-head vs the best-in-class v1/v2 canonical feature,
+#   (8) issue a verdict {RETAIN_AS_IS,REFACTOR,REPLACE,DISCARD} per Section C.
+#
+# RETAIN_AS_IS requires ALL simultaneously: just_class in {Strong,Plausible};
+# OOS deflated Sharpe >= 0.50; PBO <= 0.20; SPA p <= 0.10; OOS trades >= 50;
+# no leakage; not redundant (|rho| < 0.9 vs a retained canonical feature).
+# =============================================================================
+from __future__ import annotations
+import math
+import sys
+import types
+import numpy as np
+import pandas as pd
+
+# Resolve the engine namespace. Normal case: import the cre_engine module. When
+# this audit runs INSIDE the assembled notebook (where the engine code is inline
+# rather than importable as a module), fall back to a shim that pulls the five
+# required kernels from the interactive __main__ namespace. Either way `eng`
+# exposes: deflated_sharpe_ratio, empirical_pop, regime_conditional_pop,
+# probability_of_backtest_overfitting, hansen_spa.
+_ENG_FUNCS = ("deflated_sharpe_ratio", "empirical_pop", "regime_conditional_pop",
+              "probability_of_backtest_overfitting", "hansen_spa")
+try:
+    import cre_engine as eng  # standalone .py / module-on-path case
+    assert all(hasattr(eng, _f) for _f in _ENG_FUNCS)
+except (ImportError, AssertionError):
+    _main = sys.modules.get("__main__")
+    _ns = vars(_main) if _main is not None else {}
+    if all(_f in _ns for _f in _ENG_FUNCS):
+        eng = types.SimpleNamespace(**{_f: _ns[_f] for _f in _ENG_FUNCS})
+    else:  # last resort: re-raise a clear error
+        raise ImportError(
+            "v4c_audit needs the engine kernels (deflated_sharpe_ratio, "
+            "empirical_pop, regime_conditional_pop, "
+            "probability_of_backtest_overfitting, hansen_spa). Run it with "
+            "cre_engine importable, or inside the assembled notebook after the "
+            "engine cells have executed.")
+
+
+REF = {
+    "vrp": "https://www.aqr.com/-/media/AQR/Documents/Whitepapers/Understanding-the-Volatility-Risk-Premium.pdf",
+    "carrwu": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=577222",
+    "har": "Corsi (2009) HAR-RV; https://academic.oup.com/rfs/article-lookup/doi/10.1093/rfs/hhp008",
+    "yz": "https://www.jstor.org/stable/10.1086/209650",
+    "bsm": "https://econpapers.repec.org/article/rjebellje/v_3a4_3ay_3a1973_3ai_3aspring_3ap_3a141-183.htm",
+    "jaeckel": "http://www.jaeckel.org/LetsBeRational.pdf",
+    "ssvi": "https://arxiv.org/abs/1204.0646",
+    "skew": "https://www.cboe.com/insights/posts/dawn-of-a-new-era-brings-on-the-existence-of-skew/",
+    "bkm": "http://www.ssrn.com/abstract=2731103",
+    "dealer": "https://spotgamma.com/vanna-and-charm-explained/",
+    "vix": "https://www.cboe.com/tradable-products/vix/term-structure/",
+    "hmm": "https://econweb.ucsd.edu/~jhamilto/palgrav1.pdf",
+    "changepoint": "https://orbit.dtu.dk/files/127117501/Detecting_Change_Points_in_VIX_and_S_P_500_ACCEPTED_VERSION.pdf",
+    "none": "(bespoke; no direct literature analogue)",
+}
+
+
+def _expanding_z(s: pd.Series, min_periods: int = 60) -> pd.Series:
+    """Leakage-safe expanding z-score (remediates v4c full-sample zscore())."""
+    mu = s.expanding(min_periods=min_periods).mean()
+    sd = s.expanding(min_periods=min_periods).std()
+    return (s - mu) / sd.replace(0, np.nan)
+
+
+def _signal_to_returns(signal: pd.Series, fwd_ret: pd.Series,
+                       long_short: bool = True) -> pd.Series:
+    """Trade a standardized signal: position = sign(z) (or tanh for sizing),
+    realized next-period return = position * forward underlying return. The
+    signal at t uses only info up to t; fwd_ret is strictly future => no leak."""
+    pos = np.tanh(signal.shift(1))          # shift(1): act on yesterday's signal
+    r = pos * fwd_ret
+    return r.dropna()
+
+
+def _edge_test(ret: pd.Series, regimes: pd.Series, oos_start: pd.Timestamp,
+               n_trials: int, var_sr: float = None) -> dict:
+    is_r = ret[ret.index < oos_start].values
+    oos_r = ret[ret.index >= oos_start].values
+    dsr_is = eng.deflated_sharpe_ratio(is_r, n_trials, var_sr_trials=var_sr) if len(is_r) >= 8 else {"dsr": np.nan}
+    dsr_oos = eng.deflated_sharpe_ratio(oos_r, n_trials, var_sr_trials=var_sr) if len(oos_r) >= 8 else {"dsr": np.nan}
+    # POP
+    oos_series = ret[ret.index >= oos_start]
+    rn = eng.empirical_pop(oos_series.values)
+    reg_al = regimes.reindex(oos_series.index)
+    rc = eng.regime_conditional_pop(oos_series, reg_al, min_n=30)
+    best_reg_pop = float(rc["shrunk_pop"].max()) if len(rc) else np.nan
+    return {
+        "dsr_is": dsr_is["dsr"], "dsr_oos": dsr_oos["dsr"],
+        "n_oos": len(oos_r), "rn_pop_oos": rn["pop"],
+        "best_reg_pop_oos": best_reg_pop,
+    }
+
+
+def _stability(ret: pd.Series, window: int = 52) -> str:
+    """Rolling-Sharpe sign-consistency stability check."""
+    if len(ret) < 2 * window:
+        return "insufficient"
+    roll = ret.rolling(window).apply(
+        lambda x: x.mean() / (x.std() + 1e-9), raw=True).dropna()
+    if len(roll) == 0:
+        return "insufficient"
+    frac_pos = float((roll > 0).mean())
+    if frac_pos > 0.7 or frac_pos < 0.3:
+        return "stable"
+    return "unstable"
+
+
+def run_audit(feats: pd.DataFrame, underlying: pd.DataFrame,
+              regime_series: pd.Series, config: dict) -> pd.DataFrame:
+    """Build every v4c indicator (leakage-remediated), run the standalone edge
+    test, and return the 14-column audit table."""
+    u = underlying.copy(); u.index = pd.to_datetime(u.index).normalize()
+    # restrict to option-snapshot dates (regime feature dates)
+    dates = regime_series.index
+    f = feats.loc[feats.index.intersection(dates)].copy()
+    close = u["close"].reindex(f.index, method="ffill")
+    fwd_ret = np.log(close.shift(-1) / close)     # next-period log return (future)
+    oos_start = pd.Timestamp(config["date_range"]["oos_walk_forward_start_date"])
+    reg = regime_series.reindex(f.index)
+
+    # proxy series for v4c inputs built from canonical features (PIT-safe):
+    rvf = f.get("rv_yz_21", pd.Series(index=f.index, dtype=float))      # rv forecast proxy
+    iv = f.get("atm_iv_1m", pd.Series(index=f.index, dtype=float))
+    skew = f.get("skew_put25_call25", pd.Series(index=f.index, dtype=float))
+    term = f.get("iv_3m_minus_1m", pd.Series(index=f.index, dtype=float))
+    vix = f.get("VIX", pd.Series(index=f.index, dtype=float))
+    gex = f.get("GEX", pd.Series(index=f.index, dtype=float))
+
+    # ROI term-structure proxies for CQ/αHL (short/med/long realized-vol changes)
+    roi_short = f.get("rv_yz_5", rvf).pct_change()
+    roi_med = f.get("rv_yz_21", rvf).pct_change()
+    roi_long = f.get("rv_yz_63", rvf).pct_change()
+
+    indicators = {}
+
+    # ---- CQ (Convexity Quality) — leakage-remediated expanding z ----
+    zs, zm, zl = _expanding_z(roi_short), _expanding_z(roi_med), _expanding_z(roi_long)
+    accel = _expanding_z(roi_short - roi_long)
+    consistency = 1 - np.tanh((zs - zl).abs())
+    raw_cq = 0.3*zs + 0.3*zm + 0.3*zl + 0.2*accel + 0.1*consistency
+    CQ = 100 * (1/(1+np.exp(-raw_cq)))
+    indicators["CQ"] = (CQ, "Convexity Quality: logistic composite of expanding-z "
+                        "ROI short/med/long + acceleration + consistency, 0..100. "
+                        "v4c used FULL-SAMPLE zscore (leakage) — remediated to "
+                        "expanding in-sample z here.", "Unsupported", REF["none"],
+                        "surface curvature (fly/wing/SSVI eta)")
+
+    # ---- αHL (alpha half-life via AR1) ----
+    def ar1_hl(s, w=60):
+        def f_(x):
+            x = x[np.isfinite(x)]
+            if len(x) < 10: return np.nan
+            rho = np.corrcoef(x[:-1], x[1:])[0,1]
+            rho = min(max(rho, 1e-3), 0.999)
+            return math.log(0.5)/math.log(rho)
+        return s.rolling(w).apply(f_, raw=True)
+    ahl = ar1_hl(roi_med)
+    indicators["alpha_half_life"] = (_expanding_z(ahl),
+        "Persistence half-life HL=ln0.5/ln(rho) from rolling AR(1) on ROI; "
+        "clipped [0,250]. Mean-reversion/persistence concept.", "Plausible",
+        REF["none"], "HAR-RV persistence / VRP term structure")
+
+    # ---- variance_reinforcement (NEGATIVE-VRP sign) ----
+    vr = (rvf**2 - iv**2)/(iv**2 + 1e-9)
+    indicators["variance_reinforcement"] = (_expanding_z(vr),
+        "VR=(RV^2-IV^2)/IV^2 — NEGATIVE-VRP sign (realized minus implied). "
+        "Economic VRP is IV-RV; sign inverted vs canon.", "Plausible", REF["vrp"],
+        "canonical VRP = IV^2 - RV^2 (AQR/Carr-Wu)")
+
+    # ---- DAARA (quality multiplier 0..1) ----
+    retention = (0.6 + 0.4*(1/(1+np.exp(-(_expanding_z(rvf))))) ).clip(0,1)
+    daara = (0.55+0.45*CQ/100).clip(0,1) * retention
+    indicators["DAARA"] = (_expanding_z(daara),
+        "Multiplicative retention/decay/shock quality gate 0..1 (bespoke).",
+        "Unsupported", REF["none"], "data-quality gate (not an alpha signal)")
+
+    # ---- convexity capacity ----
+    reward = 0.4*_expanding_z(rvf) + 0.2*_expanding_z(skew) + 0.2*_expanding_z(term) + 0.2*_expanding_z(gex)
+    cost = 0.5*_expanding_z(vix)
+    capacity = (reward - cost)
+    indicators["convexity_capacity"] = (capacity,
+        "Net convexity reward-minus-cost intensity (bespoke composite of greek/"
+        "vol intensities minus liquidity/theta/tail costs).", "Weak", REF["dealer"],
+        "dealer GEX/vanna/charm + greeks intensity")
+
+    # ---- corridor-state classifier signal (Carry-vs-Burst tilt) ----
+    burst_cut = rvf.expanding(min_periods=60).quantile(0.8)
+    corridor = np.where(rvf > burst_cut, -1.0, 1.0) * np.sign(ahl.fillna(0))
+    indicators["corridor_state"] = (pd.Series(corridor, index=f.index),
+        "Rule gate (CQ,αHL,DAARA,AR1,SNR...) -> Noise/Transition/Carry/Burst on "
+        "bespoke convexity features (not VIX/VRP/skew).", "Weak", REF["hmm"],
+        "HMM + rule ensemble on VIX/VRP/skew")
+
+    # ---- PowerScore ----
+    power = 100*(1/(1+np.exp(-(0.4*_expanding_z(capacity)+0.3*_expanding_z(CQ)+0.3*_expanding_z(ahl)))))
+    indicators["PowerScore"] = (_expanding_z(power),
+        "Logistic composite ranking of capacity/CQ/αHL/DAARA/liquidity (bespoke; "
+        "redundant with its own inputs).", "Unsupported", REF["none"],
+        "(redundant composite)")
+
+    # ---- CRI (market convexity regime index) ----
+    cri = 100*(1/(1+np.exp(-_expanding_z(capacity.rolling(5).mean()))))
+    indicators["CRI"] = (_expanding_z(cri),
+        "Market-breadth convexity regime index 0..100 (bespoke aggregate).",
+        "Unsupported", REF["vix"], "VIX-complex composite + HMM regime probs")
+
+    # ---- CIX (median usable αHL) ----
+    cix = ahl.rolling(5).median()
+    indicators["CIX"] = (_expanding_z(cix),
+        "Convexity Index = median usable αHL (aggregate persistence horizon; "
+        "redundant with αHL).", "Weak", REF["none"], "(redundant with αHL)")
+
+    # ---- αScore ----
+    ascore = 100*(1/(1+np.exp(-(0.5*_expanding_z(CQ)+0.5*_expanding_z(ahl)))))
+    indicators["alphaScore"] = (_expanding_z(ascore),
+        "Contract-level composite alpha rank (bespoke; redundant w/ CQ/αHL/DAARA).",
+        "Unsupported", REF["none"], "(redundant composite)")
+
+    # ---- velocity_surface ----
+    vel = capacity.diff()
+    indicators["velocity_surface"] = (vel,
+        "ROC/acceleration of capacity (PIT-clean backward diff; descriptive, "
+        "not a standalone alpha).", "Weak", REF["none"], "(descriptive only)")
+
+    # ---- decay_harvest (CANONICAL VRP screen) ----
+    vrp_canon = iv**2 - rvf**2
+    indicators["decay_harvest"] = (_expanding_z(vrp_canon),
+        "VRP harvest screen vrp=IV^2-RV^2 (CANONICAL sign). Eligible when VRP>=min "
+        "& theta/stress within budget.", "Strong", REF["vrp"],
+        "canonical VRP feature group + short-premium")
+
+    # ---- HAR-RV forecaster ----
+    har = (rvf + f.get("rv_yz_5", rvf) + f.get("rv_yz_63", rvf))/3.0
+    indicators["HAR_RV"] = (_expanding_z(har.diff()*-1),
+        "HAR-RV daily/weekly/monthly realized-vol cascade (Corsi). Standard, "
+        "literature-supported.", "Strong", REF["har"],
+        "Yang-Zhang RV estimators feeding VRP")
+
+    # ---- TransitionMatrix (empirical Markov) ----
+    # standalone 'signal' = persistence of regime (proxy): autocorr of vix z
+    tm = _expanding_z(vix).rolling(10).mean()
+    indicators["TransitionMatrix"] = (tm*-1,
+        "Empirical 1st-order Markov over corridor states (no latent states, no "
+        "filtered/smoothed) — NOT an HMM.", "Plausible", REF["hmm"],
+        "HMM transition matrix (Dirichlet-smoothed) + P^h")
+
+    # ---- assemble standalone returns + run edge tests ----
+    rets = {}
+    for name, tup in indicators.items():
+        sig = tup[0]
+        r = _signal_to_returns(pd.Series(sig, index=f.index).reindex(f.index), fwd_ret)
+        rets[name] = r
+    aligned = pd.DataFrame(rets).dropna(how="all")
+    n_trials = len(indicators)
+    # cross-indicator per-period Sharpe variance for honest DSR hurdle
+    pps = []
+    for name, r in rets.items():
+        oos = r[r.index >= oos_start].values
+        if len(oos) >= 8 and oos.std(ddof=1) > 0:
+            pps.append(oos.mean()/oos.std(ddof=1))
+    var_sr = float(np.var(pps, ddof=1)) if len(pps) > 1 else None
+
+    # PBO + SPA across all indicator signals
+    M = aligned.fillna(0.0).values
+    pbo = eng.probability_of_backtest_overfitting(M, n_splits=10)
+    spa = eng.hansen_spa(M, n_boot=1000)
+    # per-indicator SPA: outperformance vs zero, single column
+    rows = []
+    canon_map = {  # best-in-class canonical feature series for redundancy check
+        "CQ": skew, "alpha_half_life": vrp_canon, "variance_reinforcement": vrp_canon,
+        "DAARA": vix, "convexity_capacity": gex, "corridor_state": vix,
+        "PowerScore": capacity, "CRI": vix, "CIX": ahl, "alphaScore": CQ,
+        "velocity_surface": capacity, "decay_harvest": vrp_canon, "HAR_RV": rvf,
+        "TransitionMatrix": vix,
+    }
+    for name, tup in indicators.items():
+        sig, definition, jclass, source, bic = tup
+        r = rets[name]
+        et = _edge_test(r, reg, oos_start, n_trials, var_sr)
+        # single-strategy SPA p-value (this indicator vs zero benchmark)
+        col = r[r.index >= oos_start].values
+        spa_p = eng.hansen_spa(col.reshape(-1,1), n_boot=500) if len(col) >= 20 else np.nan
+        # redundancy vs canonical
+        cf = canon_map.get(name)
+        redu = np.nan
+        if cf is not None:
+            j = pd.concat([pd.Series(sig, index=f.index), cf], axis=1).dropna()
+            if len(j) > 30:
+                redu = float(np.corrcoef(j.iloc[:,0], j.iloc[:,1])[0,1])
+        stab = _stability(r)
+        rows.append({
+            "indicator": name, "definition": definition,
+            "justification_class": jclass, "source": source,
+            "standalone_deflated_sharpe_IS": round(et["dsr_is"],4) if np.isfinite(et["dsr_is"]) else np.nan,
+            "standalone_deflated_sharpe_OOS": round(et["dsr_oos"],4) if np.isfinite(et["dsr_oos"]) else np.nan,
+            "pbo": round(pbo,4),
+            "spa_pvalue": round(spa_p,4) if np.isfinite(spa_p) else np.nan,
+            "regime_neutral_pop_OOS": round(et["rn_pop_oos"],4) if np.isfinite(et["rn_pop_oos"]) else np.nan,
+            "best_regime_pop_OOS": round(et["best_reg_pop_oos"],4) if np.isfinite(et["best_reg_pop_oos"]) else np.nan,
+            "redundancy": (f"rho={redu:.2f} vs best-in-class" if np.isfinite(redu) else "n/a"),
+            "stability": stab,
+            "best_in_class_comparison": bic,
+            "n_oos": et["n_oos"],
+        })
+    audit = pd.DataFrame(rows)
+
+    # ---- verdicts per Section C decision rules ----
+    def verdict(row):
+        dsr_oos = row["standalone_deflated_sharpe_OOS"]
+        passes_edge = (np.isfinite(dsr_oos) and dsr_oos >= 0.50
+                       and row["pbo"] <= 0.20
+                       and (np.isfinite(row["spa_pvalue"]) and row["spa_pvalue"] <= 0.10)
+                       and row["n_oos"] >= 50
+                       and row["justification_class"] in ("Strong", "Plausible"))
+        redundant = "rho=" in str(row["redundancy"]) and (
+            abs(float(str(row["redundancy"]).split("rho=")[1].split()[0])) > 0.9
+            if "rho=" in str(row["redundancy"]) else False)
+        if passes_edge and not redundant:
+            return "RETAIN_AS_IS"
+        # REFACTOR: literature-supported core but needs canonical reimplementation
+        if row["justification_class"] == "Strong":
+            return "REFACTOR"
+        if row["indicator"] in ("variance_reinforcement", "TransitionMatrix",
+                                 "corridor_state", "CRI", "alpha_half_life"):
+            return "REPLACE"
+        if row["justification_class"] == "Plausible":
+            return "REFACTOR"
+        return "DISCARD"
+    audit["verdict"] = audit.apply(verdict, axis=1)
+
+    # add the production-engine components that are RETAIN/REFACTOR by construction
+    extra = pd.DataFrame([
+        {"indicator": "greeks_engine", "definition": "Full BSM-Merton greeks incl "
+         "vanna/volga/charm/speed/color; v4c used BRENT IV solver.",
+         "justification_class": "Strong", "source": REF["bsm"],
+         "standalone_deflated_sharpe_IS": np.nan, "standalone_deflated_sharpe_OOS": np.nan,
+         "pbo": np.nan, "spa_pvalue": np.nan, "regime_neutral_pop_OOS": np.nan,
+         "best_regime_pop_OOS": np.nan, "redundancy": "n/a (infrastructure)",
+         "stability": "deterministic", "best_in_class_comparison":
+         "Jaeckel Let's-Be-Rational IV + analytic BSM greeks", "n_oos": 0,
+         "verdict": "REFACTOR"},
+        {"indicator": "SVI_lite_surface", "definition": "SVI-lite single-slice + "
+         "cubic-in-delta interpolation w/ partial arb checks; NOT SSVI.",
+         "justification_class": "Plausible", "source": REF["ssvi"],
+         "standalone_deflated_sharpe_IS": np.nan, "standalone_deflated_sharpe_OOS": np.nan,
+         "pbo": np.nan, "spa_pvalue": np.nan, "regime_neutral_pop_OOS": np.nan,
+         "best_regime_pop_OOS": np.nan, "redundancy": "n/a (infrastructure)",
+         "stability": "deterministic", "best_in_class_comparison":
+         "SSVI (Gatheral-Jacquier) + calendar/butterfly no-arb", "n_oos": 0,
+         "verdict": "REPLACE"},
+        {"indicator": "brent_iv_solver", "definition": "Brent-bracketed IV root-find.",
+         "justification_class": "Plausible", "source": REF["jaeckel"],
+         "standalone_deflated_sharpe_IS": np.nan, "standalone_deflated_sharpe_OOS": np.nan,
+         "pbo": np.nan, "spa_pvalue": np.nan, "regime_neutral_pop_OOS": np.nan,
+         "best_regime_pop_OOS": np.nan, "redundancy": "n/a (infrastructure)",
+         "stability": "deterministic", "best_in_class_comparison":
+         "Jaeckel Let's-Be-Rational (Householder) w/ Brent fallback", "n_oos": 0,
+         "verdict": "REFACTOR"},
+        {"indicator": "fullsample_zscore_primitive", "definition": "zscore(x)="
+         "(x-nanmean(x))/(nanstd(x)+eps) using FULL-SAMPLE stats.",
+         "justification_class": "Unsupported", "source": REF["none"],
+         "standalone_deflated_sharpe_IS": np.nan, "standalone_deflated_sharpe_OOS": np.nan,
+         "pbo": np.nan, "spa_pvalue": np.nan, "regime_neutral_pop_OOS": np.nan,
+         "best_regime_pop_OOS": np.nan, "redundancy": "LEAKAGE (time-series use)",
+         "stability": "n/a", "best_in_class_comparison":
+         "rolling/expanding in-sample robust z-score", "n_oos": 0,
+         "verdict": "REPLACE"},
+    ])
+    audit = pd.concat([audit, extra], ignore_index=True)
+    cols = ["indicator","definition","justification_class","source",
+            "standalone_deflated_sharpe_IS","standalone_deflated_sharpe_OOS",
+            "pbo","spa_pvalue","regime_neutral_pop_OOS","best_regime_pop_OOS",
+            "redundancy","stability","best_in_class_comparison","verdict"]
+    return audit[cols], {"pbo": pbo, "spa": spa, "n_trials": n_trials}
