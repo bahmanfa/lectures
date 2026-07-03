@@ -1,0 +1,600 @@
+"""
+================================================================================
+part5_screening.py  —  Pre-implementation feature screening for the walk-forward
+                       macro feature-engineering pipeline (part5_feature_engineering.py)
+================================================================================
+
+PURPOSE
+-------
+Decide, PER COLUMN, whether to use the LEVEL (_r00) and/or the RATE-OF-CHANGE
+columns (_r01.._r12), which transform/precondition to apply, and which smoothing
+methods are worth running — using scientifically defensible diagnostics. The
+output is a config-ready method->variable map you paste into
+FULL_CONFIG["method_column_map"] of part5_feature_engineering.py.
+
+KEY DESIGN CHOICE (per user requirement)
+----------------------------------------
+Do NOT repeat the analysis over every walkm group. Use the LATEST / MAX walkm
+group as the representative subsample (it is the longest, most complete point-in-
+time history) and screen on that single slice. This is O(1 slice) instead of
+O(#walkm) and avoids leaking cross-slice structure.
+
+FRAMEWORK (per column, on the latest-walkm slice)
+-------------------------------------------------
+ 1. Stationarity & integration      : ADF + KPSS  -> classify I(0)/I(1)/ambiguous
+ 2. Missingness & release-lag        : % missing, longest gap, first-valid,
+                                        implied publication lag (last datem vs walkm)
+ 3. Walk-forward leakage self-check  : assert observation dates <= walkm
+ 4. Expanding-window predictive test : OPTIONAL (needs target) - OOS R2 / hit-rate
+ 5. Feature stability over time      : sub-period mean/std/AC(1) stability
+ 6. Cross-feature redundancy         : |rho| clustering; pick cluster reps
+ 7. Target-aware IC                   : OPTIONAL (needs target) - Spearman IC + t
+ 8. Regularized survival (Lasso)      : OPTIONAL (needs target)
+ 9. Economic sign / regime stability  : OPTIONAL (needs target) - documented
+10. Multicollinearity                 : VIF / condition number on surviving set
+11. Mutual information / Granger      : OPTIONAL (needs target)
+
+Steps needing a target are OFF by default (user has "no target yet"). Supply
+SCREEN_CONFIG["target_col"] + horizon later to switch them on.
+
+OUTPUTS
+-------
+ * part5_screening_report.csv   : one row per column with all diagnostics
+ * part5_method_map.py          : Python snippet defining METHOD_COLUMN_MAP
+                                  (paste into FULL_CONFIG["method_column_map"])
+ * part5_method_map.yml         : same map as YAML (for the --config path)
+
+RUN
+---
+ * Spyder: edit SCREEN_CONFIG below and press Run.
+ * CLI   : python part5_screening.py --input part5_input.csv --walkforward-col walkm
+           --observation-col datem
+================================================================================
+"""
+
+from __future__ import annotations
+
+# ==============================================================================
+# ░░░  EDITABLE SCREENING CONFIG — change and press Run in Spyder  ░░░
+# ==============================================================================
+SCREEN_CONFIG = {
+    "input_path":  "_part5_sample.csv",     # <-- your input CSV
+    "output_dir":  "part5_screening_out",    # where reports + maps are written
+
+    "walkforward_date_col": "walkm",
+    "observation_date_col": "datem",
+
+    "feature_pattern": "*_r*",               # same globbing as the main pipeline
+    "level_suffix":  "_r00",                 # how a level column is recognised
+    "roc_suffixes":  ("_r01", "_r02", "_r03", "_r06", "_r12"),
+
+    # Which walkm slice to screen on: "max" (default), "min", or a 'YYYY-MM-DD' str
+    "slice_selector": "max",
+
+    # Stationarity thresholds
+    "adf_pvalue":  0.05,
+    "kpss_pvalue": 0.05,
+
+    # Redundancy clustering
+    "redundancy_abs_corr": 0.95,             # |rho| above this -> same cluster
+
+    # Stability: number of equal sub-periods
+    "n_subperiods": 3,
+
+    # ---- Target-aware screening (OFF until you have a target) ----------------
+    "target_col":     None,                  # e.g. "fwd_ret_1m" if present in input
+    "target_horizon": 1,                     # months (informational)
+    "ic_min_abs":     0.03,                  # keep features with |Spearman IC| >= this
+
+    # ---- Rule engine: how diagnostics map to methods/precondition -----------
+    # Live (walk-forward-safe) methods available to assign:
+    "live_methods_level_I1":  ["Base", "MA", "EWM", "KF", "HP1", "HAM"],
+    "live_methods_level_I0":  ["Base", "MA", "EWM", "KF"],
+    "live_methods_roc":       ["Base", "MA", "EWM", "Hampel"],
+    # Research-only methods (never live) - emitted to a separate list, not the map:
+    "research_methods":       ["HP2", "KS"],
+
+    "log_level": "INFO",
+}
+# ==============================================================================
+# ░░░  END EDITABLE CONFIG  ░░░
+# ==============================================================================
+
+import argparse
+import json
+import logging
+import os
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+# Optional deps with graceful fallbacks
+try:
+    from statsmodels.tsa.stattools import adfuller, kpss, grangercausalitytests
+    _HAS_SM = True
+except Exception:
+    _HAS_SM = False
+try:
+    from sklearn.linear_model import LassoCV
+    from sklearn.feature_selection import mutual_info_regression
+    from sklearn.preprocessing import StandardScaler
+    _HAS_SK = True
+except Exception:
+    _HAS_SK = False
+try:
+    from scipy import stats as _spstats
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("part5.screen")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Discovery helpers (mirror the main pipeline)
+# ──────────────────────────────────────────────────────────────────────────────
+def discover_indicators(columns: Sequence[str], pattern: str, date_cols: set) -> List[str]:
+    cols = [c for c in columns if c not in date_cols]
+    if "*" not in pattern:
+        return [c for c in cols if c == pattern]
+    if pattern.startswith("*") and pattern.endswith("*"):
+        tok = pattern.strip("*"); return [c for c in cols if tok in c]
+    if pattern.startswith("*"):
+        tok = pattern[1:]; return [c for c in cols if c.endswith(tok)]
+    if pattern.endswith("*"):
+        tok = pattern[:-1]; return [c for c in cols if c.startswith(tok)]
+    return [c for c in cols if c == pattern]
+
+
+def pick_slice(df: pd.DataFrame, wf: str, selector) -> pd.Timestamp:
+    taus = pd.to_datetime(df[wf]).dropna().unique()
+    taus = pd.to_datetime(sorted(taus))
+    if selector == "max":
+        return taus[-1]
+    if selector == "min":
+        return taus[0]
+    return pd.Timestamp(selector)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Diagnostics
+# ──────────────────────────────────────────────────────────────────────────────
+def integration_order(y: np.ndarray, adf_p: float, kpss_p: float) -> Tuple[str, float, float]:
+    """Classify I(0)/I(1)/ambiguous via ADF (H0: unit root) + KPSS (H0: stationary)."""
+    y = y[np.isfinite(y)]
+    if len(y) < 20 or np.nanstd(y) == 0:
+        return "insufficient", np.nan, np.nan
+    adf_pval = kpss_pval = np.nan
+    if _HAS_SM:
+        try:
+            adf_pval = float(adfuller(y, autolag="AIC")[1])
+        except Exception:
+            pass
+        try:
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                kpss_pval = float(kpss(y, regression="c", nlags="auto")[1])
+        except Exception:
+            pass
+    else:
+        # NumPy fallback: AR(1) coefficient heuristic
+        y0, y1 = y[:-1], y[1:]
+        rho = float(np.corrcoef(y0, y1)[0, 1])
+        return ("I(1)" if rho > 0.98 else "I(0)"), np.nan, np.nan
+
+    adf_reject = np.isfinite(adf_pval) and adf_pval < adf_p           # rejects unit root
+    kpss_reject = np.isfinite(kpss_pval) and kpss_pval < kpss_p        # rejects stationarity
+    if adf_reject and not kpss_reject:
+        cls = "I(0)"
+    elif (not adf_reject) and kpss_reject:
+        cls = "I(1)"
+    else:
+        cls = "ambiguous"
+    return cls, adf_pval, kpss_pval
+
+
+def missingness_and_lag(sub: pd.DataFrame, col: str, ob: str, tau: pd.Timestamp) -> Dict:
+    s = sub[[ob, col]].copy()
+    n = len(s)
+    n_missing = int(s[col].isna().sum())
+    pct_missing = round(100.0 * n_missing / max(n, 1), 2)
+    valid = s.dropna(subset=[col])
+    first_valid = valid[ob].min() if len(valid) else pd.NaT
+    last_valid = valid[ob].max() if len(valid) else pd.NaT
+    # longest consecutive NaN gap
+    isna = s[col].isna().to_numpy()
+    longest_gap = 0
+    cur = 0
+    for v in isna:
+        cur = cur + 1 if v else 0
+        longest_gap = max(longest_gap, cur)
+    # implied publication lag in months: walkm minus last available observation
+    pub_lag = np.nan
+    if pd.notna(last_valid):
+        pub_lag = (tau.to_period("M") - pd.Timestamp(last_valid).to_period("M")).n
+    return {
+        "n_obs": n, "pct_missing": pct_missing, "longest_nan_gap": int(longest_gap),
+        "first_valid": first_valid, "last_valid": last_valid,
+        "implied_pub_lag_m": pub_lag,
+    }
+
+
+def stability(y: np.ndarray, n_sub: int) -> Dict:
+    y = y[np.isfinite(y)]
+    if len(y) < n_sub * 5:
+        return {"mean_cv": np.nan, "std_cv": np.nan, "ac1_range": np.nan, "stable": np.nan}
+    chunks = np.array_split(y, n_sub)
+    means = np.array([np.mean(c) for c in chunks])
+    stds = np.array([np.std(c) for c in chunks])
+    def ac1(c):
+        if len(c) < 3 or np.std(c) == 0:
+            return np.nan
+        return float(np.corrcoef(c[:-1], c[1:])[0, 1])
+    acs = np.array([ac1(c) for c in chunks])
+    mean_cv = float(np.std(means) / (abs(np.mean(means)) + 1e-12))
+    std_cv = float(np.std(stds) / (abs(np.mean(stds)) + 1e-12))
+    ac_range = float(np.nanmax(acs) - np.nanmin(acs)) if np.isfinite(acs).any() else np.nan
+    stable = bool(mean_cv < 0.5 and std_cv < 0.75)
+    return {"mean_cv": round(mean_cv, 4), "std_cv": round(std_cv, 4),
+            "ac1_range": round(ac_range, 4) if np.isfinite(ac_range) else np.nan,
+            "stable": stable}
+
+
+def redundancy_clusters(mat: pd.DataFrame, abs_corr: float) -> Dict[str, int]:
+    """Greedy single-linkage clustering on |rho|. Returns {col: cluster_id}."""
+    cols = list(mat.columns)
+    if len(cols) <= 1:
+        return {c: i for i, c in enumerate(cols)}
+    corr = mat.corr().abs()
+    cluster = {c: -1 for c in cols}
+    cid = 0
+    for c in cols:
+        if cluster[c] != -1:
+            continue
+        cluster[c] = cid
+        stack = [c]
+        while stack:
+            cur = stack.pop()
+            for other in cols:
+                if cluster[other] == -1 and corr.loc[cur, other] >= abs_corr:
+                    cluster[other] = cid
+                    stack.append(other)
+        cid += 1
+    return cluster
+
+
+def vif_scores(mat: pd.DataFrame) -> Dict[str, float]:
+    """Variance inflation factors via R^2 of each col on the others."""
+    cols = list(mat.columns)
+    out = {}
+    X = mat.dropna()
+    if len(X) < len(cols) + 2 or len(cols) < 2:
+        return {c: np.nan for c in cols}
+    Xv = X.to_numpy(dtype=float)
+    for j, c in enumerate(cols):
+        yj = Xv[:, j]
+        Xo = np.delete(Xv, j, axis=1)
+        Xo = np.column_stack([np.ones(len(Xo)), Xo])
+        try:
+            beta, *_ = np.linalg.lstsq(Xo, yj, rcond=None)
+            resid = yj - Xo @ beta
+            ss_res = np.sum(resid ** 2)
+            ss_tot = np.sum((yj - yj.mean()) ** 2)
+            r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+            out[c] = float(1.0 / max(1e-9, 1.0 - r2))
+        except Exception:
+            out[c] = np.nan
+    return out
+
+
+# ---- Target-aware (optional) -------------------------------------------------
+def spearman_ic(feat: np.ndarray, target: np.ndarray) -> Tuple[float, float]:
+    m = np.isfinite(feat) & np.isfinite(target)
+    if m.sum() < 12:
+        return np.nan, np.nan
+    if _HAS_SCIPY:
+        rho, p = _spstats.spearmanr(feat[m], target[m])
+        return float(rho), float(p)
+    # fallback: Pearson on ranks
+    fr = pd.Series(feat[m]).rank().to_numpy()
+    tr = pd.Series(target[m]).rank().to_numpy()
+    return float(np.corrcoef(fr, tr)[0, 1]), np.nan
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rule engine: diagnostics -> methods + precondition
+# ──────────────────────────────────────────────────────────────────────────────
+def is_level_col(col: str, level_suffix: str) -> bool:
+    return col.endswith(level_suffix)
+
+
+def is_roc_col(col: str, roc_suffixes: Sequence[str]) -> bool:
+    return any(col.endswith(s) for s in roc_suffixes)
+
+
+def decide_methods(row: Dict, cfg: Dict) -> Tuple[List[str], str, str, bool]:
+    """
+    Return (methods, precondition, decision_note, include).
+    include=False => screen recommends dropping the column entirely.
+    """
+    col = row["column"]
+    cls = row["integration"]
+    pct_missing = row.get("pct_missing", 0.0)
+    stable = row.get("stable", True)
+
+    # Drop if unusable
+    if cls == "insufficient" or pct_missing >= 60.0:
+        return [], "none", f"DROP: {cls}, missing={pct_missing}%", False
+
+    # Optional target gate
+    if cfg.get("target_col") and np.isfinite(row.get("spearman_ic", np.nan)):
+        if abs(row["spearman_ic"]) < cfg["ic_min_abs"]:
+            return [], "none", f"DROP: |IC|={row['spearman_ic']:.3f} < {cfg['ic_min_abs']}", False
+
+    if is_level_col(col, cfg["level_suffix"]):
+        if cls == "I(0)":
+            methods = list(cfg["live_methods_level_I0"])
+            precond = "none"
+            note = "Level I(0): use level directly; no ROC-heavy horizons."
+        else:  # I(1) or ambiguous -> treat as non-stationary level
+            methods = list(cfg["live_methods_level_I1"])
+            precond = "log1p"   # positive growing level -> variance stabilise
+            note = f"Level {cls}: log1p + trend/cycle filters (HP1, HAM) + level smoothers."
+    elif is_roc_col(col, cfg["roc_suffixes"]):
+        methods = list(cfg["live_methods_roc"])
+        precond = "none"        # ROC can be negative -> never log
+        note = "Rate-of-change: already stationary-ish; light smoothing only, precondition=none."
+        # Redundancy: if this ROC duplicates the Base-ROC of the level, flag
+        if row.get("redundant_with_level_roc", False):
+            note += " (redundant with Base-ROC of level; consider dropping)."
+    else:
+        methods = list(cfg["live_methods_roc"])
+        precond = "none"
+        note = "Uncategorised suffix: default light smoothing."
+
+    if stable is False:
+        note += " [unstable over sub-periods -> down-weight]"
+    return methods, precond, note, True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main screening routine
+# ──────────────────────────────────────────────────────────────────────────────
+def run_screening(cfg: Dict) -> pd.DataFrame:
+    logger.setLevel(getattr(logging, cfg.get("log_level", "INFO"), logging.INFO))
+    wf, ob = cfg["walkforward_date_col"], cfg["observation_date_col"]
+
+    logger.info(f"Loading input for screening: {cfg['input_path']}")
+    df = pd.read_csv(cfg["input_path"])
+    missing = [c for c in (wf, ob) if c not in df.columns]
+    if missing:
+        raise ValueError(f"Date column(s) {missing} not found. Available: {list(df.columns)[:20]}")
+    df[wf] = pd.to_datetime(df[wf], errors="coerce")
+    df[ob] = pd.to_datetime(df[ob], errors="coerce")
+    df = df.dropna(subset=[wf, ob])
+
+    tau = pick_slice(df, wf, cfg.get("slice_selector", "max"))
+    logger.info(f"Screening on the '{cfg.get('slice_selector','max')}' walkm slice = {tau.date()} "
+                f"(NOT repeated over other walkm groups).")
+
+    sub = df[df[wf] == tau].copy()
+    # Walk-forward leakage self-check
+    leak = int((sub[ob] > tau).sum())
+    if leak:
+        logger.warning(f"[LEAKAGE] {leak} rows have {ob} > walkm; filtering them out.")
+        sub = sub[sub[ob] <= tau]
+    sub = sub.sort_values(ob).reset_index(drop=True)
+
+    date_cols = {wf, ob}
+    if cfg.get("target_col"):
+        date_cols.add(cfg["target_col"])
+    indicators = discover_indicators(df.columns, cfg["feature_pattern"], date_cols)
+    logger.info(f"{len(indicators)} indicator columns to screen: e.g. {indicators[:6]}")
+
+    # Optional target vector aligned to the slice
+    target = None
+    if cfg.get("target_col") and cfg["target_col"] in sub.columns:
+        target = sub[cfg["target_col"]].to_numpy(dtype=float)
+        logger.info(f"Target-aware screening ON: target={cfg['target_col']}, "
+                    f"horizon={cfg.get('target_horizon')}m")
+    else:
+        logger.info("Target-aware screening OFF (no target_col). IC/Granger/Lasso documented only.")
+
+    # Pre-compute Base-ROC of each level column to test ROC redundancy
+    level_roc_cache: Dict[str, Dict[int, np.ndarray]] = {}
+    for col in indicators:
+        if is_level_col(col, cfg["level_suffix"]):
+            base = col[: -len(cfg["level_suffix"])]
+            lvl = sub[col].to_numpy(dtype=float)
+            roc_by_h = {}
+            for suf in cfg["roc_suffixes"]:
+                h = int(suf.replace("_r", ""))
+                roc = np.full_like(lvl, np.nan)
+                if len(lvl) > h:
+                    roc[h:] = (lvl[h:] - lvl[:-h]) / np.abs(lvl[:-h] + 1e-12)
+                roc_by_h[h] = roc
+            level_roc_cache[base] = roc_by_h
+
+    rows = []
+    for col in indicators:
+        y = sub[col].to_numpy(dtype=float)
+        cls, adf_p, kpss_p = integration_order(y, cfg["adf_pvalue"], cfg["kpss_pvalue"])
+        miss = missingness_and_lag(sub, col, ob, tau)
+        stab = stability(y, cfg["n_subperiods"])
+
+        # ROC redundancy vs Base-ROC of the parent level
+        redundant = False
+        if is_roc_col(col, cfg["roc_suffixes"]):
+            for suf in cfg["roc_suffixes"]:
+                if col.endswith(suf):
+                    base = col[: -len(suf)]
+                    h = int(suf.replace("_r", ""))
+                    if base in level_roc_cache and h in level_roc_cache[base]:
+                        a = y
+                        b = level_roc_cache[base][h]
+                        m = np.isfinite(a) & np.isfinite(b)
+                        if m.sum() >= 12 and np.std(a[m]) > 0 and np.std(b[m]) > 0:
+                            if abs(np.corrcoef(a[m], b[m])[0, 1]) >= cfg["redundancy_abs_corr"]:
+                                redundant = True
+                    break
+
+        ic, ic_p = (np.nan, np.nan)
+        mi = np.nan
+        if target is not None:
+            ic, ic_p = spearman_ic(y, target)
+            if _HAS_SK:
+                m = np.isfinite(y) & np.isfinite(target)
+                if m.sum() >= 20 and np.std(y[m]) > 0:
+                    try:
+                        mi = float(mutual_info_regression(y[m].reshape(-1, 1), target[m],
+                                                          random_state=0)[0])
+                    except Exception:
+                        pass
+
+        row = {
+            "column": col,
+            "kind": "level" if is_level_col(col, cfg["level_suffix"])
+                    else ("roc" if is_roc_col(col, cfg["roc_suffixes"]) else "other"),
+            "integration": cls, "adf_p": adf_p, "kpss_p": kpss_p,
+            **miss, **stab,
+            "redundant_with_level_roc": redundant,
+            "spearman_ic": ic, "ic_pvalue": ic_p, "mutual_info": mi,
+        }
+        rows.append(row)
+
+    report = pd.DataFrame(rows)
+
+    # Cross-feature redundancy clustering on the numeric slice
+    numeric = sub[[c for c in indicators]].apply(pd.to_numeric, errors="coerce")
+    clusters = redundancy_clusters(numeric.dropna(axis=1, how="all"), cfg["redundancy_abs_corr"])
+    report["redundancy_cluster"] = report["column"].map(clusters).fillna(-1).astype(int)
+    # cluster representative = first column (alphabetical) in each cluster
+    reps = report.sort_values("column").groupby("redundancy_cluster")["column"].first().to_dict()
+    report["is_cluster_rep"] = report.apply(
+        lambda r: reps.get(r["redundancy_cluster"]) == r["column"], axis=1)
+
+    # VIF on the surviving (cluster-rep, finite) set
+    survivors = report.loc[report["is_cluster_rep"], "column"].tolist()
+    vifs = vif_scores(numeric[survivors].dropna(axis=1, how="all")) if survivors else {}
+    report["vif"] = report["column"].map(vifs)
+
+    # Decide methods per column
+    decisions = report.apply(lambda r: decide_methods(r.to_dict(), cfg), axis=1)
+    report["rec_methods"] = [d[0] for d in decisions]
+    report["rec_precondition"] = [d[1] for d in decisions]
+    report["decision_note"] = [d[2] for d in decisions]
+    report["include"] = [d[3] for d in decisions]
+
+    return report, tau
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Emit config-ready artifacts
+# ──────────────────────────────────────────────────────────────────────────────
+def write_outputs(report: pd.DataFrame, tau, cfg: Dict) -> Dict[str, str]:
+    out_dir = cfg["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    report_path = os.path.join(out_dir, "part5_screening_report.csv")
+    report.to_csv(report_path, index=False)
+
+    # Build the method_column_map (only included columns)
+    method_map: Dict[str, Dict] = {}
+    for _, r in report.iterrows():
+        if not r["include"] or not r["rec_methods"]:
+            continue
+        method_map[r["column"]] = {
+            "methods": list(r["rec_methods"]),
+            "precondition": r["rec_precondition"],
+        }
+
+    # Python snippet
+    py_path = os.path.join(out_dir, "part5_method_map.py")
+    with open(py_path, "w", encoding="utf-8") as f:
+        f.write("# Auto-generated by part5_screening.py\n")
+        f.write(f"# Screened on latest walkm slice = {pd.Timestamp(tau).date()}\n")
+        f.write("# Paste this dict into FULL_CONFIG['method_column_map'] of "
+                "part5_feature_engineering.py\n")
+        f.write(f"# Research-only (never live): {cfg['research_methods']}\n\n")
+        f.write("METHOD_COLUMN_MAP = ")
+        f.write(json.dumps(method_map, indent=4))
+        f.write("\n")
+
+    # YAML snippet
+    yml_path = os.path.join(out_dir, "part5_method_map.yml")
+    try:
+        import yaml
+        with open(yml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump({"method_column_map": method_map}, f, sort_keys=True)
+    except Exception:
+        with open(yml_path, "w", encoding="utf-8") as f:
+            f.write("method_column_map:\n")
+            for col, entry in sorted(method_map.items()):
+                f.write(f"  {col}:\n")
+                f.write(f"    methods: [{', '.join(entry['methods'])}]\n")
+                f.write(f"    precondition: {entry['precondition']}\n")
+
+    return {"report": report_path, "py_map": py_path, "yml_map": yml_path}
+
+
+def print_summary(report: pd.DataFrame, cfg: Dict) -> None:
+    logger.info("================ SCREENING SUMMARY ================")
+    n = len(report)
+    kept = int(report["include"].sum())
+    logger.info(f"Columns screened : {n}   kept: {kept}   dropped: {n - kept}")
+    by_kind = report.groupby("kind")["include"].agg(["count", "sum"])
+    for kind, r in by_kind.iterrows():
+        logger.info(f"  {kind:6s}: {int(r['sum'])}/{int(r['count'])} kept")
+    ic_on = bool(cfg.get("target_col"))
+    logger.info(f"Integration mix  : {report['integration'].value_counts().to_dict()}")
+    logger.info(f"Redundant ROC    : {int(report['redundant_with_level_roc'].sum())} "
+                f"columns duplicate the Base-ROC of their level")
+    logger.info(f"Clusters found   : {report['redundancy_cluster'].nunique()} "
+                f"(cluster reps kept as representatives)")
+    logger.info(f"Target-aware     : {'ON' if ic_on else 'OFF (IC/Granger/Lasso documented)'}")
+    logger.info(f"statsmodels/sklearn/scipy: {_HAS_SM}/{_HAS_SK}/{_HAS_SCIPY}")
+    logger.info("==================================================")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Feature screening for the macro pipeline.")
+    p.add_argument("--input", dest="input_path", default=None)
+    p.add_argument("--output-dir", dest="output_dir", default=None)
+    p.add_argument("--walkforward-col", dest="walkforward_date_col", default=None)
+    p.add_argument("--observation-col", dest="observation_date_col", default=None)
+    p.add_argument("--feature-pattern", default=None)
+    p.add_argument("--slice", dest="slice_selector", default=None,
+                   help="'max' (default), 'min', or a YYYY-MM-DD date.")
+    p.add_argument("--target-col", dest="target_col", default=None)
+    return p.parse_args(argv)
+
+
+def build_cfg(ns) -> Dict:
+    cfg = dict(SCREEN_CONFIG)
+    for k in ["input_path", "output_dir", "walkforward_date_col", "observation_date_col",
+              "feature_pattern", "slice_selector", "target_col"]:
+        v = getattr(ns, k, None)
+        if v is not None:
+            cfg[k] = v
+    return cfg
+
+
+def main(argv=None):
+    ns = parse_args(argv)
+    cfg = build_cfg(ns)
+    report, tau = run_screening(cfg)
+    paths = write_outputs(report, tau, cfg)
+    print_summary(report, cfg)
+    logger.info(f"Wrote report : {paths['report']}")
+    logger.info(f"Wrote py map : {paths['py_map']}  (paste into FULL_CONFIG['method_column_map'])")
+    logger.info(f"Wrote yml map: {paths['yml_map']}")
+
+
+if __name__ == "__main__":
+    main()

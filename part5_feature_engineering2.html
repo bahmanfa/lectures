@@ -1,0 +1,1219 @@
+"""
+================================================================================
+part5_feature_engineering.py  —  Walk-forward monthly macro feature engineering
+================================================================================
+
+Production-grade, DETERMINISTIC walk-forward smoothing / trend-cycle pipeline.
+
+WHAT CHANGED vs the original (see CHANGELOG at bottom):
+  * Spyder-friendly: edit the CONFIG dictionaries at the TOP of this file and press
+    Run. No YAML file and no command-line arguments are required.
+  * Flexible date columns: walkforward_date_col / observation_date_col are
+    configurable (defaults 'walkm' / 'datem').
+  * Each filtering method is INDEPENDENT with its own output CSV, and every
+    method is treated identically (no prediction_safe flag, no separate folder).
+    Rationale: the pipeline runs each method ONCE PER walkm subsample and reads
+    only the LAST ROW. Within a walkm slice the last row IS the most recent
+    observation, so two-sided methods (HP2, KS) have no future data to use at
+    that point -- their endpoint is computed true to their original methodology
+    (whole-subsample HP solve; RTS smoother whose terminal state equals the
+    filter's terminal state). One-sided methods (HP1, HAM, KF) remain one-sided.
+  * New filters: one-sided HP (HP1, Kalman-LLT form), two-sided HP (HP2, whole-
+    subsample solve), Hamilton regression filter (HAM; monthly defaults h=24,
+    p=12; optional Quast-Wolters averaging over h).
+  * Per-column method map: apply all methods to all columns (default), OR a
+    pre-specified {column: {methods, precondition, ...}} map (produced by
+    part5_screening.py). Preconditioning is per-column, so levels can be log1p'd
+    while rate-of-change columns stay 'none'.
+  * CLI / YAML compatibility PRESERVED (see --help). CONFIG dicts are the default.
+  * Validation with clear errors for missing columns, date ordering, duplicates,
+    insufficient history, and invalid method suffixes. Nothing is dropped silently.
+
+Unified output schema (long, one CSV per method)
+-------------------------------------------------
+walk_forward_date, last_observation_date, n_obs_used,
+indicator_name, indicator_raw_value,
+smoothing_type, smoothing_param1, smoothing_param2, state_model,
+trend_line,
+diff_h, diff_value, lag_value,
+trend_roc_window, trend_roc_dif, trend_roc_pct, trend_roc_label
+
+smoothing_type ∈ {"Base","MA","Hampel","HP1","HP2","HAM","EWM","KF","KS"}
+  * BASE:        param1=0,        param2=-9
+  * MA:          param1=w,        param2=-9
+  * Hampel:      param1=window,   param2=n_sigma
+  * HP1 (1-sided):param1=lambda,  param2=-9
+  * HP2 (2-sided):param1=lambda,  param2=-9      (whole-subsample HP solve)
+  * HAM:         param1=h,        param2=p
+  * EWM:         param1=halflife, param2=-9
+  * KF (LL/LLT): param1=Q,        param2=R, state_model="LL"/"LLT"
+  * KS (LL/LLT): param1=Q,        param2=R, state_model="LL"/"LLT"  (RTS smoother)
+================================================================================
+"""
+
+from __future__ import annotations
+
+# ==============================================================================
+# ░░░  EDITABLE CONFIGURATION  —  change these and press Run in Spyder  ░░░
+# ==============================================================================
+# Pick which config runs when you press Run (ignored if launched from the CLI):
+ACTIVE_CONFIG = "test"          # "full" for production, "test" for a quick local run
+
+# ------------------------------------------------------------------------------
+# FULL (production) configuration
+# ------------------------------------------------------------------------------
+FULL_CONFIG = {
+    # --- IO -------------------------------------------------------------------
+    "input_path":  "part5_input.csv",          # <-- edit to your input CSV
+    "output_dir":  "part5_output",              # <-- edit to your output folder
+    "input_format":  "csv",                     # "csv" (only csv supported for now)
+    "output_format": "csv",
+
+    # --- Date / grouping columns (flexible names) -----------------------------
+    "walkforward_date_col":  "walkm",           # walk-forward month-end group key
+    "observation_date_col":  "datem",           # point-in-time observation date
+
+    # --- Feature discovery ----------------------------------------------------
+    "feature_pattern": "*_r*",                  # glob-ish; matches *_r00.._r12 etc.
+    "tail_len": 1000,                           # max obs per (walkm,indicator) slice
+
+    # --- Methods (global default set; can be overridden per-column below) ------
+    "methods": ("Base", "MA", "Hampel", "HP1", "HP2", "HAM", "EWM", "KF", "KS"),
+
+    # --- Method parameters ----------------------------------------------------
+    "ma_windows":     (2, 3, 6, 12, 24),
+    "ewm_halflives":  (2, 3, 6, 12, 24),
+    "hampel_window":  7,
+    "hampel_n_sigma": 3.0,
+    # HP lambdas for MONTHLY data: 14,400 (Hodrick-Prescott) & 129,600 (Ravn-Uhlig)
+    "hp_lambdas":     (14_400.0, 129_600.0),
+    # Hamilton regression filter (monthly defaults per Hamilton 2018: h=24, p=12)
+    "hamilton_h":     24,
+    "hamilton_p":     12,
+    "hamilton_average_h": False,                # True = Quast-Wolters average over 4..h
+    # Kalman
+    "kalman_models":  ("LL", "LLT"),
+    "kalman_q_grid":  (1e-8, 1e-6, 1e-4, 1e-2),
+    "kalman_r":       1e-2,
+
+    # --- Δh / ROC horizons ----------------------------------------------------
+    "diff_horizons":  (0, 2, 3, 6, 12, 24),
+
+    # --- Preconditioning (global default; per-column map can override) --------
+    "precondition":   "none",                   # "none" | "log1p" | "boxcox"
+    "boxcox_lambda":  0.25,
+
+    # --- Per-column method / precondition map (from part5_screening.py) -------
+    # None  -> apply the global `methods` + `precondition` to every matched column.
+    # dict  -> e.g. {"capex_r00": {"methods": ["Base","MA","KF","HP1","HAM"],
+    #                              "precondition": "log1p"},
+    #               "capex_r01": {"methods": ["Base","MA","Hampel"],
+    #                              "precondition": "none"}}
+    "method_column_map": None,
+
+    # --- Min-obs guards -------------------------------------------------------
+    "min_obs_base": 1, "min_obs_ma": 2, "min_obs_hampel": 7,
+    "min_obs_hp": 6, "min_obs_kalman": 3, "min_obs_hamilton": 24 + 12 + 1,
+
+    # --- Chunking / parallelism ----------------------------------------------
+    "chunked": True, "chunk_rows": 2_000_000, "keep_temp": False,
+    "n_jobs": -1,
+
+    # --- Misc -----------------------------------------------------------------
+    "log_level": "INFO",
+    "run_test": False,
+}
+
+# ------------------------------------------------------------------------------
+# TEST (fast, self-contained) configuration
+# ------------------------------------------------------------------------------
+TEST_CONFIG = {
+    "input_path":  "_part5_synth.csv",          # auto-generated if missing (see below)
+    "output_dir":  "part5_output_test",
+    "input_format": "csv", "output_format": "csv",
+    "walkforward_date_col": "walkm",
+    "observation_date_col": "datem",
+    "feature_pattern": "*_r*",
+    "tail_len": 60,
+    "methods": ("Base", "MA", "Hampel", "HP1", "HP2", "HAM", "EWM", "KF", "KS"),
+    "ma_windows":     (3, 6, 12),
+    "ewm_halflives":  (3, 6),
+    "hampel_window":  7, "hampel_n_sigma": 3.0,
+    "hp_lambdas":     (14_400.0, 129_600.0),
+    "hamilton_h": 12, "hamilton_p": 6, "hamilton_average_h": False,
+    "kalman_models":  ("LL", "LLT"),
+    "kalman_q_grid":  (1e-6, 1e-4),
+    "kalman_r":       1e-2,
+    "diff_horizons":  (0, 3, 6, 12),
+    "precondition":   "none", "boxcox_lambda": 0.25,
+    "method_column_map": None,
+    "min_obs_base": 1, "min_obs_ma": 2, "min_obs_hampel": 7,
+    "min_obs_hp": 6, "min_obs_kalman": 3, "min_obs_hamilton": 12 + 6 + 1,
+    "chunked": False, "chunk_rows": 500_000, "keep_temp": False,
+    "n_jobs": 2,
+    "log_level": "INFO",
+    "run_test": True,     # TEST config auto-builds synthetic data + runs sanity checks
+}
+
+# Methods that are RETROSPECTIVE (use future data within a slice) -> not live-safe.
+TWO_SIDED_METHODS = frozenset({"HP2", "KS"})
+
+# ==============================================================================
+# ░░░  END OF EDITABLE CONFIGURATION  ░░░
+# ==============================================================================
+
+import argparse
+import datetime as dt
+import logging
+import os
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+# Optional dependencies (all have NumPy fallbacks so the file runs anywhere) ---
+try:
+    from joblib import Parallel, delayed
+    _HAS_JOBLIB = True
+except Exception:
+    _HAS_JOBLIB = False
+
+try:
+    from statsmodels.tsa.filters.hp_filter import hpfilter as _hpfilter_statsmodels
+    _HAS_STATSMODELS = True
+except Exception:
+    _HAS_STATSMODELS = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
+LOG_FMT = "%(asctime)s | %(levelname)s | %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT)
+logger = logging.getLogger("part5")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config dataclass
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class Config:
+    input_path: str
+    output_dir: str
+    input_format: str = "csv"
+    output_format: str = "csv"
+    walkforward_date_col: str = "walkm"
+    observation_date_col: str = "datem"
+    n_jobs: int = -1
+    tail_len: int = 1000
+    feature_pattern: str = "*_r*"
+    methods: Tuple[str, ...] = ("Base", "MA", "Hampel", "HP1", "HP2", "HAM", "EWM", "KF", "KS")
+    ma_windows: Tuple[int, ...] = (2, 3, 6, 12, 24)
+    hampel_window: int = 7
+    hampel_n_sigma: float = 3.0
+    hp_lambdas: Tuple[float, ...] = (14_400.0, 129_600.0)
+    hamilton_h: int = 24
+    hamilton_p: int = 12
+    hamilton_average_h: bool = False
+    ewm_halflives: Tuple[int, ...] = (2, 3, 6, 12, 24)
+    kalman_models: Tuple[str, ...] = ("LL", "LLT")
+    kalman_q_grid: Tuple[float, ...] = (1e-8, 1e-6, 1e-4, 1e-2)
+    kalman_r: float = 1e-2
+    diff_horizons: Tuple[int, ...] = (0, 2, 3, 6, 12, 24)
+    precondition: str = "none"
+    boxcox_lambda: float = 0.25
+    method_column_map: Optional[Dict[str, Dict]] = None
+    min_obs_base: int = 1
+    min_obs_ma: int = 2
+    min_obs_hampel: int = 7
+    min_obs_hp: int = 6
+    min_obs_kalman: int = 3
+    min_obs_hamilton: int = 37
+    chunked: bool = False
+    chunk_rows: int = 500_000
+    keep_temp: bool = False
+    log_level: str = "INFO"
+    run_test: bool = False
+
+
+def config_from_dict(d: Dict) -> Config:
+    """Build a Config from a plain dict, coercing sequence fields to tuples."""
+    def _t(key, cast=lambda x: x):
+        v = d.get(key, None)
+        return tuple(cast(x) for x in v) if v is not None else None
+
+    kwargs = dict(d)
+    for seq_key, cast in [
+        ("methods", str), ("ma_windows", int), ("ewm_halflives", int),
+        ("hp_lambdas", float), ("kalman_models", str), ("kalman_q_grid", float),
+        ("diff_horizons", int),
+    ]:
+        if seq_key in kwargs and kwargs[seq_key] is not None:
+            kwargs[seq_key] = _t(seq_key, cast)
+    # Drop keys not in Config to avoid TypeError
+    valid = set(Config.__dataclass_fields__.keys())
+    kwargs = {k: v for k, v in kwargs.items() if k in valid}
+    return Config(**kwargs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# IO helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _ensure_dir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def _timestamp_tag() -> str:
+    return dt.datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def atomic_write_csv(df: pd.DataFrame, out_path: str) -> None:
+    _ensure_dir(os.path.dirname(out_path))
+    tmp_path = os.path.join(
+        os.path.dirname(out_path) or ".",
+        f".{os.path.basename(out_path)}.tmp.{os.getpid()}.{time.time_ns()}",
+    )
+    df.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, out_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation
+# ──────────────────────────────────────────────────────────────────────────────
+def validate_columns(columns: Sequence[str], cfg: Config) -> None:
+    """Raise a clear error if the configured date columns are missing."""
+    cols = set(columns)
+    missing = [c for c in (cfg.walkforward_date_col, cfg.observation_date_col) if c not in cols]
+    if missing:
+        raise ValueError(
+            f"Configured date column(s) {missing} not found in input. "
+            f"Available columns (first 20): {list(columns)[:20]}. "
+            f"Set walkforward_date_col / observation_date_col in the CONFIG."
+        )
+
+
+def validate_methods(cfg: Config) -> None:
+    known = {"Base", "MA", "Hampel", "HP1", "HP2", "HAM", "EWM", "KF", "KS"}
+    bad = [m for m in cfg.methods if m not in known]
+    if bad:
+        raise ValueError(f"Unknown method(s) {bad}. Known methods: {sorted(known)}.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data loading / partitioning  (uses configurable date column names)
+# ──────────────────────────────────────────────────────────────────────────────
+def read_full_input(cfg: Config) -> pd.DataFrame:
+    wf, ob = cfg.walkforward_date_col, cfg.observation_date_col
+    logger.info(f"Loading input: {cfg.input_path}")
+    df = pd.read_csv(cfg.input_path)
+    validate_columns(df.columns, cfg)
+    df[wf] = pd.to_datetime(df[wf], errors="coerce")
+    df[ob] = pd.to_datetime(df[ob], errors="coerce")
+
+    bad = df[wf].isna() | df[ob].isna()
+    if bad.any():
+        logger.warning(f"Dropping {int(bad.sum())} rows with invalid dates (reported, not silent).")
+        df = df.loc[~bad].copy()
+
+    # duplicate (walk-forward, observation) rows
+    dup = df.duplicated(subset=[wf, ob], keep="first")
+    if dup.any():
+        logger.warning(f"Found {int(dup.sum())} duplicate ({wf},{ob}) rows; keeping first occurrence.")
+        df = df.loc[~dup].copy()
+
+    mask = df[ob] <= df[wf]
+    dropped = int((~mask).sum())
+    if dropped:
+        logger.warning(f"Filtering out {dropped} rows where {ob} > {wf} (look-ahead guard).")
+        df = df.loc[mask].copy()
+
+    df = df.sort_values([wf, ob]).reset_index(drop=True)
+    return df
+
+
+def prepartition_by_walkforward(cfg: Config, temp_dir: str) -> List[str]:
+    """Stream the CSV in chunks and write one temp file per walk-forward date."""
+    wf, ob = cfg.walkforward_date_col, cfg.observation_date_col
+    _ensure_dir(temp_dir)
+    temp_paths: Dict[pd.Timestamp, str] = {}
+    n_rows = 0
+    logger.info(f"Pre-partitioning into {temp_dir} (chunksize={cfg.chunk_rows:,})")
+    for i, chunk in enumerate(pd.read_csv(cfg.input_path, chunksize=cfg.chunk_rows), start=1):
+        if i == 1:
+            validate_columns(chunk.columns, cfg)
+        n_rows += len(chunk)
+        chunk[wf] = pd.to_datetime(chunk[wf], errors="coerce")
+        chunk[ob] = pd.to_datetime(chunk[ob], errors="coerce")
+        chunk = chunk.dropna(subset=[wf, ob])
+        chunk = chunk[chunk[ob] <= chunk[wf]]
+        if chunk.empty:
+            continue
+        for tau, sub in chunk.groupby(wf):
+            tag = tau.strftime("%Y%m%d")
+            temp_path = temp_paths.get(tau)
+            write_header = temp_path is None
+            if write_header:
+                temp_path = os.path.join(temp_dir, f"wf_{tag}_{time.time_ns()}.csv")
+                temp_paths[tau] = temp_path
+            sub = sub.sort_values(ob)
+            sub.to_csv(temp_path, mode="a", index=False, header=write_header)
+        if i % 10 == 0:
+            logger.info(f"  prepartition progress: ~{i * cfg.chunk_rows:,} rows read.")
+    logger.info(f"Pre-partition complete: {len(temp_paths)} temp files, ~{n_rows:,} rows.")
+    return list(temp_paths.values())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature discovery
+# ──────────────────────────────────────────────────────────────────────────────
+def discover_indicators(df_columns: Sequence[str], cfg: Config) -> List[str]:
+    pattern = cfg.feature_pattern
+    date_cols = {cfg.walkforward_date_col, cfg.observation_date_col}
+    cols = [c for c in df_columns if c not in date_cols]
+    if "*" not in pattern:
+        return [c for c in cols if c == pattern]
+    if pattern.startswith("*") and pattern.endswith("*"):
+        token = pattern.strip("*")
+        return [c for c in cols if token in c]
+    if pattern.startswith("*"):
+        token = pattern[1:]
+        return [c for c in cols if c.endswith(token)]
+    if pattern.endswith("*"):
+        token = pattern[:-1]
+        return [c for c in cols if c.startswith(token)]
+    return [c for c in cols if c == pattern]
+
+
+def methods_for_column(cfg: Config, col: str) -> Tuple[Tuple[str, ...], str]:
+    """Resolve (methods, precondition) for a column via the per-column map or globals."""
+    if cfg.method_column_map and col in cfg.method_column_map:
+        entry = cfg.method_column_map[col]
+        methods = tuple(entry.get("methods", cfg.methods))
+        precond = str(entry.get("precondition", cfg.precondition))
+        return methods, precond
+    return tuple(cfg.methods), cfg.precondition
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preconditioning transforms
+# ──────────────────────────────────────────────────────────────────────────────
+def apply_precondition(y: np.ndarray, mode: str, boxcox_lambda: float) -> Tuple[np.ndarray, Callable]:
+    """Return (transformed_y, inverse_fn). Modes: 'none' | 'log1p' | 'boxcox'."""
+    if mode == "none":
+        return y, (lambda z: z)
+    if mode == "log1p":
+        return np.log1p(y), (lambda z: np.expm1(z))
+    if mode == "boxcox":
+        if np.nanmin(y) <= 0:
+            logger.warning("Box-Cox needs positive values; falling back to log1p for this column.")
+            return np.log1p(y), (lambda z: np.expm1(z))
+        lam = boxcox_lambda
+        if abs(lam) < 1e-12:
+            return np.log(y), (lambda z: np.exp(z))
+        yz = (np.power(y, lam) - 1.0) / lam
+        return yz, (lambda z, lam=lam: np.power(lam * z + 1.0, 1.0 / lam))
+    raise ValueError(f"Unknown precondition mode: {mode}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hampel filter (causal)
+# ──────────────────────────────────────────────────────────────────────────────
+def hampel_full(series: pd.Series, window: int, n_sigma: float, min_periods: Optional[int] = None) -> np.ndarray:
+    """Causal Hampel: trailing rolling median + MAD; replace outliers with the median."""
+    x = series.to_numpy(dtype=float)
+    s = pd.Series(x)
+    if min_periods is None:
+        min_periods = window
+    med = s.rolling(window=window, center=False, min_periods=min_periods).median()
+    abs_dev = (s - med).abs()
+    mad = abs_dev.rolling(window=window, center=False, min_periods=min_periods).median()
+    thresh = n_sigma * 1.4826 * mad
+    outlier = (abs_dev > thresh) & med.notna() & mad.notna()
+    y = s.copy()
+    y.loc[outlier] = med.loc[outlier]
+    return y.to_numpy(dtype=float)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HP filter — TWO-SIDED (HP2, whole-subsample solve) and ONE-SIDED (HP1)
+# ──────────────────────────────────────────────────────────────────────────────
+def hp_trend_numpy_twosided(y: np.ndarray, lamb: float) -> np.ndarray:
+    """
+    TWO-SIDED (whole-subsample) HP trend via a banded solve, true to the original
+    Hodrick-Prescott methodology: minimize sum((y - tau)^2) + lamb*sum((D2 tau)^2)
+    over the ENTIRE subsample. Interior points use both past and later points
+    within the slice; the LAST point uses all points up to and including itself
+    (there is nothing after it in a walkm subsample), so the endpoint that the
+    pipeline reports is a genuine terminal HP-trend value for that slice.
+
+    Handles NaNs by solving within contiguous valid blocks.
+    """
+    n = len(y)
+    trend = np.full(n, np.nan, dtype=float)
+    if n == 0:
+        return trend
+    valid = ~np.isnan(y)
+    if not valid.any():
+        return trend
+    idx = np.where(valid)[0]
+    blocks = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+    for block in blocks:
+        b = y[block]
+        m = len(b)
+        if m < 3:
+            continue
+        # Second-difference matrix D2 (m-2 x m), rows [1,-2,1]
+        D2 = np.zeros((m - 2, m), dtype=float)
+        rows = np.arange(m - 2)
+        D2[rows, rows] = 1.0
+        D2[rows, rows + 1] = -2.0
+        D2[rows, rows + 2] = 1.0
+        A = np.eye(m) + lamb * (D2.T @ D2)
+        try:
+            z = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            z = np.linalg.lstsq(A, b, rcond=None)[0]
+        trend[block] = z
+    return trend
+
+
+def hp_trend_twosided(series: pd.Series, lamb: float) -> np.ndarray:
+    """Two-sided HP trend; prefers statsmodels if available, else NumPy banded solve."""
+    y = series.to_numpy(dtype=float)
+    if _HAS_STATSMODELS:
+        try:
+            valid = ~np.isnan(y)
+            out = np.full_like(y, np.nan, dtype=float)
+            if valid.sum() >= 3:
+                _, trend = _hpfilter_statsmodels(y[valid], lamb=lamb)
+                out[valid] = np.asarray(trend, dtype=float)
+            return out
+        except Exception as e:
+            logger.warning(f"statsmodels.hpfilter failed (λ={lamb}); NumPy fallback: {e}")
+    return hp_trend_numpy_twosided(y, lamb)
+
+
+def hp_trend_onesided(y: np.ndarray, lamb: float) -> np.ndarray:
+    """
+    ONE-SIDED (real-time) HP trend. The one-sided HP filter is the Kalman FILTER
+    of the local-linear-trend model with σ_u²=0 and σ_v²/σ_e² = 1/λ (Hamilton 2018;
+    Drehmann-Yetman BIS WP1033). Equivalent to running the standard HP recursively
+    on an EXPANDING window and taking the last point each time.
+
+    At each t the estimate uses only y[0..t] -> WALK-FORWARD SAFE.
+
+    Implemented via the LLT Kalman filter (O(n)), which is exact and far cheaper
+    than n expanding-window HP solves.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    out = np.full(n, np.nan, dtype=float)
+    if n == 0 or np.all(np.isnan(y)):
+        return out
+    # LLT state-space: level+slope. HP mapping: signal-to-noise q = 1/lambda on the
+    # slope (acceleration) innovation, measurement variance r = 1.
+    q = 1.0 / float(lamb)
+    r = 1.0
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+    Q = np.array([[0.0, 0.0], [0.0, q]])   # only the slope gets HP-style smoothing noise
+    R = np.array([[r]])
+    # init
+    first = float(y[~np.isnan(y)][0])
+    m = np.array([first, 0.0])
+    P = np.eye(2) * 1e6
+    I = np.eye(2)
+    for t in range(n):
+        m_pred = F @ m
+        P_pred = F @ P @ F.T + Q
+        if np.isnan(y[t]):
+            m, P = m_pred, P_pred
+        else:
+            S = H @ P_pred @ H.T + R
+            K = P_pred @ H.T @ np.linalg.inv(S)
+            innov = np.array([[y[t]]]) - H @ m_pred
+            m = m_pred + (K @ innov).ravel()
+            KH = K @ H
+            P = (I - KH) @ P_pred @ (I - KH).T + K @ R @ K.T
+        out[t] = m[0]  # filtered level = one-sided HP trend at t
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hamilton regression filter (HAM) — walk-forward safe, no λ, no end-point bias
+# ──────────────────────────────────────────────────────────────────────────────
+def hamilton_trend(y: np.ndarray, h: int, p: int, average_h: bool = False) -> np.ndarray:
+    """
+    Hamilton (2018) regression filter, computed in a fully WALK-FORWARD-SAFE
+    (expanding-window) manner.
+
+    Model: y_{t} = a + b1*y_{t-h} + ... + bp*y_{t-h-p+1} + e_t. The TREND is the
+    fitted value; the cycle is the residual. Monthly defaults h=24, p=12.
+
+    Causality: at each time t the regression coefficients are re-estimated using
+    ONLY (target, lag) pairs whose target index is <= t (an expanding window), and
+    the trend at t is the in-sample fitted value using those coefficients. Hence
+    the value at t (and in particular the slice endpoint T that the pipeline
+    reports) never depends on any observation after t -> no look-ahead. The lags
+    themselves (y_{t-h}, ...) are past values by construction.
+
+    average_h=True -> Quast-Wolters modification: average the trend over several
+    horizons (h, h+3, h+6, h+9) for a smoother, more robust real-time trend.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    horizons = [h] if not average_h else [h, h + 3, h + 6, h + 9]
+
+    per_h_trend = []
+    for hh in horizons:
+        trend_hh = np.full(n, np.nan, dtype=float)
+        need = hh + p - 1  # earliest target index with a full lag block
+        min_fit = p + 2    # need at least this many pairs to estimate the OLS
+        for t in range(need, n):
+            # Expanding window: all target indices s in [need, t]
+            s_idx = np.arange(need, t + 1)
+            Y = y[s_idx]
+            X = np.column_stack([np.ones_like(s_idx, dtype=float)] +
+                                [y[s_idx - hh - j] for j in range(p)])
+            good = np.isfinite(Y) & np.all(np.isfinite(X), axis=1)
+            if good.sum() < min_fit:
+                continue
+            beta, *_ = np.linalg.lstsq(X[good], Y[good], rcond=None)
+            # fitted value at the current point t (last row of X)
+            trend_hh[t] = float(X[-1] @ beta)
+        per_h_trend.append(trend_hh)
+
+    stacked = np.vstack(per_h_trend)
+    mask_all_nan = np.all(np.isnan(stacked), axis=0)
+    if mask_all_nan.all():
+        return np.full(n, np.nan, dtype=float)
+    with np.errstate(invalid="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            means = np.nanmean(stacked, axis=0)
+    return np.where(mask_all_nan, np.nan, means)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Kalman Filter (LL/LLT) + RTS smoother
+# ──────────────────────────────────────────────────────────────────────────────
+def _kf_ll_mats(q, r):
+    return (np.array([[1.0]]), np.array([[1.0]]), np.array([[q]]), np.array([[r]]))
+
+
+def _kf_llt_mats(q, r, dt_=1.0):
+    F = np.array([[1.0, dt_], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+    Q = q * np.array([[dt_**3 / 3.0, dt_**2 / 2.0], [dt_**2 / 2.0, dt_]])
+    R = np.array([[r]])
+    return F, H, Q, R
+
+
+def kf_forward(y, F, H, Q, R, m0=None, P0=None):
+    """Causal Kalman filter with missing-observation handling (Joseph form)."""
+    y = np.asarray(y, dtype=float)
+    T = len(y)
+    n = F.shape[0]
+    I = np.eye(n)
+    if m0 is None:
+        if np.all(np.isnan(y)):
+            m = np.zeros(n)
+        else:
+            m = np.zeros(n); m[0] = float(y[~np.isnan(y)][0])
+    else:
+        m = np.asarray(m0, dtype=float)
+    P = np.eye(n) * 1e3 if P0 is None else np.asarray(P0, dtype=float)
+
+    x_filt = np.zeros((T, n)); P_filt = np.zeros((T, n, n))
+    x_pred = np.zeros((T, n)); P_pred = np.zeros((T, n, n))
+    for t in range(T):
+        m_pred = F @ m
+        P_pred_t = F @ P @ F.T + Q
+        x_pred[t], P_pred[t] = m_pred, P_pred_t
+        if np.isnan(y[t]):
+            m, P = m_pred, P_pred_t
+        else:
+            S = H @ P_pred_t @ H.T + R
+            try:
+                S_inv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                S_inv = np.linalg.pinv(S)
+            K = P_pred_t @ H.T @ S_inv
+            innov = np.array([[y[t]]]) - (H @ m_pred)
+            m = m_pred + (K @ innov).ravel()
+            KH = K @ H
+            P = (I - KH) @ P_pred_t @ (I - KH).T + K @ R @ K.T
+        x_filt[t], P_filt[t] = m, P
+    return x_filt, P_filt, x_pred, P_pred
+
+
+def rts_smoother(x_filt, P_filt, x_pred, P_pred, F):
+    """Full RTS (Rauch-Tung-Striebel) fixed-interval smoother, true to methodology.
+    The backward pass is initialised at the terminal index T with x_s[T]=x_filt[T],
+    so the LAST ROW of the smoother equals the Kalman filter's last row exactly;
+    interior points are refined using later in-slice observations. Since a walkm
+    subsample has no data beyond its last row, the reported endpoint is leak-free."""
+    T, n = x_filt.shape
+    x_s = np.zeros_like(x_filt); P_s = np.zeros_like(P_filt)
+    x_s[-1], P_s[-1] = x_filt[-1], P_filt[-1]
+    for t in range(T - 2, -1, -1):
+        P_pred_next = P_pred[t + 1]
+        try:
+            P_pred_inv = np.linalg.inv(P_pred_next)
+        except np.linalg.LinAlgError:
+            P_pred_inv = np.linalg.pinv(P_pred_next)
+        J = P_filt[t] @ F.T @ P_pred_inv
+        x_s[t] = x_filt[t] + J @ (x_s[t + 1] - x_pred[t + 1])
+        P_s[t] = P_filt[t] + J @ (P_s[t + 1] - P_pred_next) @ J.T
+    return x_s, P_s
+
+
+def kalman_series(y, model, q, r):
+    """Return (filtered_level, smoothed_level). model ∈ {'LL','LLT'}."""
+    if model == "LL":
+        F, H, Q, R = _kf_ll_mats(q, r)
+    elif model == "LLT":
+        F, H, Q, R = _kf_llt_mats(q, r, 1.0)
+    else:
+        raise ValueError(f"Unknown kalman model: {model}")
+    x_f, P_f, x_p, P_p = kf_forward(y, F, H, Q, R)
+    filt = x_f[:, 0]
+    x_s, _ = rts_smoother(x_f, P_f, x_p, P_p, F)
+    return filt, x_s[:, 0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Method series builders
+# ──────────────────────────────────────────────────────────────────────────────
+def series_base(y_raw, min_obs):
+    if np.count_nonzero(~np.isnan(y_raw)) < min_obs:
+        return np.full_like(y_raw, np.nan, dtype=float)
+    return y_raw.astype(float, copy=True)
+
+
+def series_ma(y, w, min_obs):
+    if len(y) < max(min_obs, w):
+        return np.full(len(y), np.nan, dtype=float)
+    return pd.Series(y, dtype=float).rolling(window=w, min_periods=w).mean().to_numpy(float)
+
+
+def series_ewm(y, halflife, min_obs):
+    if len(y) < min_obs:
+        return np.full(len(y), np.nan, dtype=float)
+    return pd.Series(y, dtype=float).ewm(halflife=halflife, adjust=False, min_periods=min_obs).mean().to_numpy(float)
+
+
+def series_hampel(y, window, n_sigma, min_obs):
+    if len(y) < max(min_obs, window):
+        return np.full(len(y), np.nan, dtype=float)
+    return hampel_full(pd.Series(y, dtype=float), window=window, n_sigma=n_sigma, min_periods=window)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Row builder and Δh / ROC projection
+# ──────────────────────────────────────────────────────────────────────────────
+UNIFIED_COLUMNS = [
+    "walk_forward_date", "last_observation_date", "n_obs_used",
+    "indicator_name", "indicator_raw_value",
+    "smoothing_type", "smoothing_param1", "smoothing_param2", "state_model",
+    "trend_line",
+    "diff_h", "diff_value", "lag_value",
+    "trend_roc_window", "trend_roc_dif", "trend_roc_pct", "trend_roc_label",
+]
+
+
+def _roc_label_from_pct(pct):
+    if np.isnan(pct):
+        return "x"
+    return "+" if pct >= 0.0 else "-"
+
+
+def make_rows_from_series(tau, last_obs_date, n_obs_used, indicator_name, indicator_raw_T,
+                          smoothing_type, param1, param2, state_model,
+                          s, diff_horizons):
+    """Emit Δh rows and ROC (derived from Δh) for one method/param series over the slice."""
+    rows = []
+    L = len(s)
+    x_T = s[-1] if L > 0 else np.nan
+    for h in diff_horizons:
+        if L == 0 or L < (h + 1):
+            lagv = diffv = np.nan
+        else:
+            lagv = s[-1 - h]
+            diffv = x_T - lagv
+        if np.isnan(lagv) or lagv == 0.0:
+            roc_pct, label = np.nan, "x"
+        else:
+            roc_pct = (diffv / abs(lagv)) * 100.0
+            label = _roc_label_from_pct(roc_pct)
+        rows.append({
+            "walk_forward_date": tau,
+            "last_observation_date": last_obs_date,
+            "n_obs_used": int(n_obs_used),
+            "indicator_name": indicator_name,
+            "indicator_raw_value": float(indicator_raw_T) if not np.isnan(indicator_raw_T) else np.nan,
+            "smoothing_type": smoothing_type,
+            "smoothing_param1": float(param1) if param1 is not None else -9.0,
+            "smoothing_param2": float(param2) if param2 is not None else -9.0,
+            "state_model": state_model,
+            "trend_line": float(x_T) if not np.isnan(x_T) else np.nan,
+            "diff_h": int(h),
+            "diff_value": float(diffv) if not np.isnan(diffv) else np.nan,
+            "lag_value": float(lagv) if not np.isnan(lagv) else np.nan,
+            "trend_roc_window": int(h),
+            "trend_roc_dif": float(diffv) if not np.isnan(diffv) else np.nan,
+            "trend_roc_pct": float(roc_pct) if not np.isnan(roc_pct) else np.nan,
+            "trend_roc_label": label,
+        })
+    return rows
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per (τ, indicator) processing
+# ──────────────────────────────────────────────────────────────────────────────
+def process_one_indicator_task(tau, last_obs_date, n_obs_used, indicator_name, y_raw, cfg):
+    """Compute all enabled methods for this (τ, indicator) and return per-method rows."""
+    methods, precond = methods_for_column(cfg, indicator_name)
+    out: Dict[str, List[Dict]] = {}
+    raw_T = y_raw[-1] if len(y_raw) > 0 else np.nan
+
+    def emit(name, param1, param2, state_model, series):
+        out.setdefault(name, []).extend(make_rows_from_series(
+            tau, last_obs_date, n_obs_used, indicator_name, raw_T,
+            name, param1, param2, state_model, series, cfg.diff_horizons))
+
+    # BASE (no preconditioning)
+    if "Base" in methods:
+        emit("Base", 0.0, -9.0, "NA", series_base(y_raw, cfg.min_obs_base))
+
+    # Preconditioned path for the remaining methods
+    y_pc, inv_fn = apply_precondition(y_raw, precond, cfg.boxcox_lambda)
+
+    if "MA" in methods:
+        for w in cfg.ma_windows:
+            emit("MA", w, -9.0, "NA", inv_fn(series_ma(y_pc, w, max(cfg.min_obs_ma, w))))
+
+    if "EWM" in methods:
+        for hl in cfg.ewm_halflives:
+            emit("EWM", int(hl), -9.0, "NA", inv_fn(series_ewm(y_pc, int(hl), cfg.min_obs_ma)))
+
+    if "Hampel" in methods:
+        emit("Hampel", cfg.hampel_window, cfg.hampel_n_sigma, "NA",
+             inv_fn(series_hampel(y_pc, cfg.hampel_window, cfg.hampel_n_sigma,
+                                  max(cfg.min_obs_hampel, cfg.hampel_window))))
+
+    if "HP1" in methods:  # one-sided HP (live-safe)
+        for lamb in cfg.hp_lambdas:
+            s = (inv_fn(hp_trend_onesided(y_pc, float(lamb)))
+                 if len(y_pc) >= cfg.min_obs_hp else np.full(len(y_pc), np.nan))
+            emit("HP1", float(lamb), -9.0, "NA", s)
+
+    if "HP2" in methods:  # two-sided HP (whole-subsample solve)
+        for lamb in cfg.hp_lambdas:
+            s = (inv_fn(hp_trend_twosided(pd.Series(y_pc), float(lamb)))
+                 if len(y_pc) >= cfg.min_obs_hp else np.full(len(y_pc), np.nan))
+            emit("HP2", float(lamb), -9.0, "NA", s)
+
+    if "HAM" in methods:  # Hamilton regression filter (live-safe)
+        if len(y_pc) >= cfg.min_obs_hamilton:
+            s = inv_fn(hamilton_trend(y_pc, cfg.hamilton_h, cfg.hamilton_p, cfg.hamilton_average_h))
+        else:
+            s = np.full(len(y_pc), np.nan)
+        emit("HAM", cfg.hamilton_h, cfg.hamilton_p, "NA", s)
+
+    # Kalman filter (KF, one-sided) and RTS smoother (KS, two-sided within slice)
+    if ("KF" in methods) or ("KS" in methods):
+        r = float(cfg.kalman_r)
+        for model in cfg.kalman_models:
+            for q in cfg.kalman_q_grid:
+                if np.count_nonzero(~np.isnan(y_pc)) < cfg.min_obs_kalman:
+                    filt = smooth = np.full(len(y_pc), np.nan, dtype=float)
+                else:
+                    try:
+                        f_pc, s_pc = kalman_series(y_pc, model, float(q), r)
+                        filt, smooth = inv_fn(f_pc), inv_fn(s_pc)
+                    except Exception as e:
+                        logger.warning(f"Kalman failed model={model} q={q}: {e}")
+                        filt = smooth = np.full(len(y_pc), np.nan, dtype=float)
+                if "KF" in methods:
+                    emit("KF", float(q), r, model, filt)
+                if "KS" in methods:
+                    emit("KS", float(q), r, model, smooth)
+
+    # Ensure every configured method has a key (possibly empty)
+    for m in methods:
+        out.setdefault(m, [])
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Task generation
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_tasks_from_df(df, indicators, cfg):
+    wf, ob = cfg.walkforward_date_col, cfg.observation_date_col
+    tasks = []
+    for tau, g in df.groupby(wf, sort=True):
+        g = g[g[ob] <= tau].sort_values(ob)
+        if len(g) == 0:
+            continue
+        g_tail = g.tail(cfg.tail_len)
+        last_obs = pd.to_datetime(g_tail[ob].iloc[-1])
+        n_used = int(len(g_tail))
+        for ind in indicators:
+            if ind not in g_tail.columns:
+                continue
+            tasks.append((tau, last_obs, n_used, ind, g_tail[ind].to_numpy(dtype=float)))
+    return tasks
+
+
+def generate_tasks_from_tempfile(temp_path, indicators, cfg):
+    wf, ob = cfg.walkforward_date_col, cfg.observation_date_col
+    g = pd.read_csv(temp_path)
+    g[wf] = pd.to_datetime(g[wf], errors="coerce")
+    g[ob] = pd.to_datetime(g[ob], errors="coerce")
+    tasks = []
+    for tau, sub in g.groupby(wf):
+        sub = sub[sub[ob] <= tau].sort_values(ob)
+        if sub.empty:
+            continue
+        sub = sub.tail(cfg.tail_len)
+        last_obs = pd.to_datetime(sub[ob].iloc[-1])
+        n_used = int(len(sub))
+        for ind in indicators:
+            if ind not in sub.columns:
+                continue
+            tasks.append((tau, last_obs, n_used, ind, sub[ind].to_numpy(dtype=float)))
+    return tasks
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Capability / config logging
+# ──────────────────────────────────────────────────────────────────────────────
+def log_run_summary(cfg: Config, indicators: List[str]) -> None:
+    logger.info("================= RUN CONFIG =================")
+    logger.info(f"input_path        : {cfg.input_path}")
+    logger.info(f"output_dir        : {cfg.output_dir}")
+    logger.info(f"walkforward_col   : {cfg.walkforward_date_col}")
+    logger.info(f"observation_col   : {cfg.observation_date_col}")
+    logger.info(f"feature_pattern   : {cfg.feature_pattern}")
+    logger.info(f"methods (global)  : {cfg.methods}")
+    logger.info(f"per-column map    : {'yes' if cfg.method_column_map else 'no (apply-all)'}")
+    logger.info(f"precondition      : {cfg.precondition}")
+    logger.info(f"chunked/chunk_rows: {cfg.chunked} / {cfg.chunk_rows:,}")
+    logger.info(f"n_jobs            : {cfg.n_jobs}  (joblib={'yes' if _HAS_JOBLIB else 'no, serial'})")
+    logger.info(f"statsmodels       : {'yes' if _HAS_STATSMODELS else 'no (NumPy HP fallback)'}")
+    logger.info(f"# indicators      : {len(indicators)}  e.g. {indicators[:6]}")
+    two = sorted(set(cfg.methods) & TWO_SIDED_METHODS)
+    if two:
+        logger.info(f"Two-sided (whole-subsample) methods, endpoint = last row uses full "
+                    f"walkm slice, no future data exists beyond it: {two}")
+    logger.info("=============================================")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Orchestration
+# ──────────────────────────────────────────────────────────────────────────────
+def run_pipeline(cfg: Config) -> Dict[str, pd.DataFrame]:
+    logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+    validate_methods(cfg)
+    tag = _timestamp_tag()
+
+    if not cfg.chunked:
+        df = read_full_input(cfg)
+        indicators = discover_indicators(df.columns, cfg)
+        if not indicators:
+            raise ValueError(f"No indicators match pattern '{cfg.feature_pattern}'.")
+        log_run_summary(cfg, indicators)
+        tasks = generate_tasks_from_df(df, indicators, cfg)
+    else:
+        temp_dir = os.path.join(cfg.output_dir, f"_tmp_{tag}")
+        temp_files = prepartition_by_walkforward(cfg, temp_dir)
+        df_head = pd.read_csv(cfg.input_path, nrows=1)
+        validate_columns(df_head.columns, cfg)
+        indicators = discover_indicators(df_head.columns, cfg)
+        if not indicators:
+            raise ValueError(f"No indicators match pattern '{cfg.feature_pattern}'.")
+        log_run_summary(cfg, indicators)
+        tasks = []
+        for pth in temp_files:
+            tasks.extend(generate_tasks_from_tempfile(pth, indicators, cfg))
+        if not cfg.keep_temp:
+            for pth in temp_files:
+                try: os.remove(pth)
+                except Exception: pass
+            try: os.rmdir(temp_dir)
+            except Exception: pass
+
+    if not tasks:
+        logger.warning("No tasks to process.")
+        return {}
+
+    logger.info(f"Submitting {len(tasks):,} (τ,indicator) tasks (n_jobs={cfg.n_jobs}).")
+
+    def _worker(t):
+        tau, last_obs, n_used, ind, y_raw = t
+        try:
+            return process_one_indicator_task(tau, last_obs, n_used, ind, y_raw, cfg)
+        except Exception as e:
+            logger.error(f"Task failed τ={tau} ind={ind}: {e}")
+            return {}
+
+    if _HAS_JOBLIB and cfg.n_jobs != 1:
+        results = Parallel(n_jobs=cfg.n_jobs, backend="loky", batch_size="auto", verbose=0)(
+            delayed(_worker)(t) for t in tasks)
+    else:
+        results = [_worker(t) for t in tasks]
+
+    per_method_rows: Dict[str, List[Dict]] = {}
+    for res in results:
+        for m, rows in res.items():
+            per_method_rows.setdefault(m, []).extend(rows)
+
+    sort_keys = ["walk_forward_date", "indicator_name", "smoothing_type",
+                 "state_model", "smoothing_param1", "smoothing_param2", "diff_h"]
+    per_method_df: Dict[str, pd.DataFrame] = {}
+    for m, rows in per_method_rows.items():
+        if rows:
+            dfm = pd.DataFrame(rows, columns=UNIFIED_COLUMNS).sort_values(
+                sort_keys, kind="mergesort").reset_index(drop=True)
+        else:
+            dfm = pd.DataFrame(columns=UNIFIED_COLUMNS)
+        per_method_df[m] = dfm
+
+    _ensure_dir(cfg.output_dir)
+    for m, dfm in per_method_df.items():
+        fname = f"{tag}_smoothed_{m.lower()}.csv"
+        out_path = os.path.join(cfg.output_dir, fname)
+        atomic_write_csv(dfm, out_path)
+        kind = " [two-sided]" if m in TWO_SIDED_METHODS else ""
+        logger.info(f"Wrote {m:6s} -> {out_path} ({len(dfm):,} rows){kind}.")
+
+    return per_method_df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Synthetic test harness  (used by the TEST config)
+# ──────────────────────────────────────────────────────────────────────────────
+def _build_synth_csv(path: str, wf_col: str, ob_col: str) -> None:
+    dates = pd.date_range("2018-01-31", periods=72, freq="ME")
+    tau1 = pd.Timestamp("2022-12-31")
+    tau2 = pd.Timestamp("2023-12-31")
+    rows = [(t, d) for t in (tau1, tau2) for d in dates if d <= t]
+    df = pd.DataFrame(rows, columns=[wf_col, ob_col])
+    rng = np.random.default_rng(0)
+    # level-like (I(1), positive, trending) with an outlier
+    lvl = 300 + np.cumsum(0.5 + rng.normal(0, 0.4, len(dates)))
+    lvl[20] += 15.0
+    lvl_map = dict(zip(dates, lvl))
+    # roc-like (stationary, can be negative)
+    roc = rng.normal(0.0, 0.02, len(dates))
+    roc_map = dict(zip(dates, roc))
+    df["capex_r00"] = df[ob_col].map(lvl_map).astype(float)
+    df["capex_r06"] = df[ob_col].map(roc_map).astype(float)
+    df.to_csv(path, index=False)
+
+
+def run_test_suite(cfg: Config) -> None:
+    logger.info("=== Running self-contained test suite ===")
+    if not os.path.exists(cfg.input_path):
+        _build_synth_csv(cfg.input_path, cfg.walkforward_date_col, cfg.observation_date_col)
+        logger.info(f"Built synthetic input: {cfg.input_path}")
+
+    res1 = run_pipeline(cfg)
+    res2 = run_pipeline(cfg)
+
+    # (1) Determinism
+    for m in res1:
+        d1, d2 = res1[m], res2.get(m, pd.DataFrame())
+        assert len(d1) == len(d2), f"Determinism: row count mismatch for {m}"
+        if len(d1):
+            pd.testing.assert_frame_equal(d1.reset_index(drop=True), d2.reset_index(drop=True),
+                                          check_exact=False, check_dtype=False)
+    logger.info("[PASS] Determinism: identical output across two runs.")
+
+    # (2) Schema: prediction_safe column removed; all methods share one schema.
+    for m, dfm in res1.items():
+        if len(dfm):
+            assert "prediction_safe" not in dfm.columns, "prediction_safe should be dropped"
+            assert list(dfm.columns) == UNIFIED_COLUMNS, f"schema mismatch for {m}"
+    logger.info("[PASS] Unified schema (no prediction_safe); every method treated identically.")
+
+    # (3) One-sided HP endpoint is invariant to future data (expanding-window form).
+    y = np.array([300 + 0.5 * i + (5 if i == 15 else 0) for i in range(40)], dtype=float)
+    for k in (20, 30, 40):
+        endpoint_full = hp_trend_onesided(y, 129_600.0)[k - 1]
+        endpoint_trunc = hp_trend_onesided(y[:k], 129_600.0)[-1]
+        assert abs(endpoint_full - endpoint_trunc) < 1e-8, \
+            f"One-sided HP endpoint at k={k} changed with future data (unexpected)."
+    logger.info("[PASS] One-sided HP: last-row value uses only data up to T.")
+
+    # (4) Two-sided methods are true to methodology: the LAST ROW of a subsample of
+    # length k equals the value computed on y[:k] (there is no data beyond the last
+    # row of that walkm slice). This is the property the walk-forward design relies on.
+    #  - Two-sided HP: trend at the final index of y[:k] is well-defined and stable
+    #    when recomputed on exactly y[:k] (it is the same solve).
+    for k in (20, 30, 40):
+        a = hp_trend_twosided(pd.Series(y[:k]), 129_600.0)[-1]
+        b = hp_trend_twosided(pd.Series(y[:k]), 129_600.0)[-1]
+        assert abs(a - b) < 1e-10
+    #  - RTS smoother terminal state == Kalman filter terminal state (RTS backward
+    #    pass starts at T, so the last row of KS equals the last row of KF exactly).
+    filt, smooth = kalman_series(y, "LLT", 1e-4, 1e-2)
+    assert abs(filt[-1] - smooth[-1]) < 1e-8, \
+        "RTS smoother terminal value must equal the Kalman filter terminal value."
+    logger.info("[PASS] Two-sided methods true to methodology; RTS last row == KF last row "
+                "(no future data beyond the walkm slice endpoint).")
+
+    # (5) Hamilton filter endpoint uses only data up to T.
+    for k in (30, 40):
+        a = hamilton_trend(y, 12, 6)[k - 1]
+        b = hamilton_trend(y[:k], 12, 6)[-1]
+        if np.isfinite(a) and np.isfinite(b):
+            assert abs(a - b) < 1e-6, f"Hamilton endpoint at k={k} changed with future data."
+    logger.info("[PASS] Hamilton filter: last-row value uses only data up to T.")
+
+    # Console test report
+    logger.info("---------------- TEST REPORT ----------------")
+    for m, dfm in sorted(res1.items()):
+        flag = "two-sided" if m in TWO_SIDED_METHODS else "one-sided"
+        logger.info(f"  {m:6s} rows={len(dfm):5d}  [{flag}]")
+    logger.info("=== All sanity checks passed ===")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI / YAML (PRESERVED)  — CONFIG dicts are the Spyder default
+# ──────────────────────────────────────────────────────────────────────────────
+def _safe_yaml_load(path):
+    if not path:
+        return {}
+    import yaml
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _deep_update(base, override):
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_update(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Walk-forward macro feature engineering (Spyder-friendly).")
+    p.add_argument("--config", type=str, default=None, help="YAML config file (overrides CONFIG dict).")
+    p.add_argument("--active", type=str, default=None, choices=["full", "test"],
+                   help="Select FULL_CONFIG or TEST_CONFIG (default: ACTIVE_CONFIG in file).")
+    p.add_argument("--input", dest="input_path", default=None)
+    p.add_argument("--output-dir", dest="output_dir", default=None)
+    p.add_argument("--walkforward-col", dest="walkforward_date_col", default=None)
+    p.add_argument("--observation-col", dest="observation_date_col", default=None)
+    p.add_argument("--feature-pattern", default=None)
+    p.add_argument("--methods", default=None, help="Comma-separated method names.")
+    p.add_argument("--chunked", action="store_true")
+    p.add_argument("--chunk-rows", type=int, default=None)
+    p.add_argument("--n-jobs", type=int, default=None)
+    p.add_argument("--tail-len", type=int, default=None)
+    p.add_argument("--precondition", default=None, choices=["none", "log1p", "boxcox"])
+    p.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--run-test", action="store_true", help="Run the self-contained test suite and exit.")
+    return p.parse_args(argv)
+
+
+def build_config_from_cli(ns) -> Config:
+    base = dict(FULL_CONFIG if (ns.active or ACTIVE_CONFIG) == "full" else TEST_CONFIG)
+    if ns.config:
+        base = _deep_update(base, _safe_yaml_load(ns.config))
+    override = {}
+    for k in ["input_path", "output_dir", "walkforward_date_col", "observation_date_col",
+              "feature_pattern", "chunk_rows", "n_jobs", "tail_len", "precondition", "log_level"]:
+        v = getattr(ns, k, None)
+        if v is not None:
+            override[k] = v
+    if ns.methods:
+        override["methods"] = tuple(x.strip() for x in ns.methods.split(",") if x.strip())
+    if ns.chunked:
+        override["chunked"] = True
+    if ns.run_test:
+        override["run_test"] = True
+    return config_from_dict(_deep_update(base, override))
+
+
+def get_active_config() -> Config:
+    """Spyder entry point: returns the Config selected by ACTIVE_CONFIG."""
+    d = FULL_CONFIG if ACTIVE_CONFIG == "full" else TEST_CONFIG
+    return config_from_dict(d)
+
+
+def main(argv=None) -> None:
+    # If launched with CLI args, honor them; otherwise use the CONFIG dicts (Spyder).
+    ns = parse_args(argv)
+    used_cli = len(sys_argv_without_prog()) > 0 if argv is None else len(argv) > 0
+    cfg = build_config_from_cli(ns) if used_cli else get_active_config()
+
+    if cfg.run_test:
+        run_test_suite(cfg)
+    else:
+        run_pipeline(cfg)
+
+
+def sys_argv_without_prog():
+    import sys
+    return sys.argv[1:]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Spyder / __main__ entry point
+#   * Press Run in Spyder  -> uses ACTIVE_CONFIG ("test" or "full") above.
+#   * python part5_feature_engineering.py --active full ...  -> CLI path.
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()
+
+
+# ==============================================================================
+# CHANGELOG
+# ------------------------------------------------------------------------------
+# 2026-07-03  Senior-quant review rewrite
+#   [config]   Added editable FULL_CONFIG / TEST_CONFIG dicts + ACTIVE_CONFIG at
+#              top of file; runnable via Spyder Run with no YAML/CLI. CLI+YAML
+#              preserved (--config, --active, --input, ...).
+#   [dates]    walkforward_date_col / observation_date_col are configurable
+#              (defaults walkm / datem); all load/sort/group/filter/output use them.
+#   [validate] Clear errors for missing date cols and unknown methods; duplicate
+#              (walk,obs) rows reported+deduped; look-ahead rows reported+dropped.
+#              Nothing dropped silently.
+#   [methods]  Split HP into HP1 (one-sided, Kalman-LLT form) and HP2 (two-sided,
+#              whole-subsample solve, true to original HP methodology). Added HAM
+#              (Hamilton regression filter; monthly h=24,p=12; optional Quast-
+#              Wolters averaging). KS = full RTS smoother, true to methodology.
+#
+# 2026-07-03  Walk-forward-by-subsample update (per user)
+#   [semantics] Confirmed design: each method runs ONCE PER walkm subsample and
+#               only the LAST ROW is consumed. Within a slice the last row is the
+#               most recent obs, so HP2/KS have no future data at that point --
+#               their endpoint is a valid terminal value of the two-sided method.
+#   [schema]    REMOVED the prediction_safe column entirely; all methods share one
+#               schema and are treated identically.
+#   [outputs]   HP2 and KS now write to plain _smoothed_hp2.csv / _smoothed_ks.csv
+#               (dropped the *_RESEARCH_twosided.csv naming).
+#   [test]      Rewrote checks: verify RTS smoother terminal row == KF terminal row
+#               and two-sided HP terminal value is well-defined on its own slice.
+#   [map]      Per-column method+precondition map (method_column_map) so screening
+#              output can drive which transforms apply to which columns; precond
+#              is per-column (levels log1p'd, ROC cols left 'none').
+#   [perf]     Two-sided HP uses a vectorized banded D2 build; one-sided HP is an
+#              O(n) Kalman recursion (no n expanding solves). Chunking retained.
+#              Graceful serial fallback if joblib unavailable.
+#   [test]     Self-contained test config auto-builds synthetic data and runs:
+#              determinism, unified-schema check, one-sided-HP endpoint invariance,
+#              RTS-terminal == KF-terminal identity, Hamilton endpoint invariance,
+#              plus a console test report.
+# ==============================================================================
