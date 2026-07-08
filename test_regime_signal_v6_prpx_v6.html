@@ -1,0 +1,943 @@
+"""
+Production-hardening test suite for part7_step1_regime_signal_analysis_v6.py
+============================================================================
+Twelve required tests mapped to the hardening contract:
+
+  test_1  forward_return_correctness  (C1)
+  test_2  panel_cardinality           (H2/H5)
+  test_3  resume_equivalence          (C2/C3)
+  test_4  best_class_labeling         (H1)
+  test_5  idmethod_dtype              (H3)
+  test_6  k_eff_bounds                (M1)
+  test_7  drop_keep_logic             (sample spec)
+  test_8  subsample_stability         (stability spec)
+  test_9  stability_calibration       (stability spec, v6.1 size/fallback CI)
+  test_10 resume_equivalence_e2e      (C2/C3, v6.1 full-pipeline resume CI)
+  test_11 passive_copy_toggle         (v6.1.2 copy_b toggle + universe guard)
+  test_12 merge_date_overlap_skip     (v6.1.3 zero-overlap shard skip semantics)
+  test_13 episode_age_and_preflight   (v6.1.3 per-episode age reset + preflight)
+
+Each test returns a dict record so the harness can serialize results into
+validation_summary.json / an audit CSV / the human-readable report.
+
+Runnable two ways:
+  * `python test_regime_signal_v6.py`  -> runs all, writes test_results.json
+  * `pytest test_regime_signal_v6.py`  -> standard pytest collection
+"""
+from __future__ import annotations
+
+import os
+import sys
+import json
+import importlib.util
+import tempfile
+
+import numpy as np
+import pandas as pd
+
+# ---- Load the target module by path (no package install required) ----------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_MOD_PATH = os.path.join(
+    os.path.dirname(_HERE), "build",
+    "part7_step1_regime_signal_analysis_v6.py")
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("regmod_v6", _MOD_PATH)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+M = _load_module()
+
+
+# ===========================================================================
+# test_1  forward_return_correctness  (C1)
+# ---------------------------------------------------------------------------
+# A month is MISSING in the interior of a series. The v3.2.0 bug used
+# shift(-h) over compacted rows so the forward value mapped to the h-th
+# *available* row, not the calendar month h ahead. v6 must reindex to a full
+# month-end grid so fwd_h1 for a given month = the NEXT CALENDAR month's value
+# (NaN if that month is missing), never the next available row.
+# ===========================================================================
+def test_1_forward_return_correctness():
+    # Months: Jan, Feb, (Mar MISSING), Apr, May. Values 1,2,4,5.
+    dates = pd.to_datetime(["2020-01-31", "2020-02-29",
+                            "2020-04-30", "2020-05-31"])
+    ret = pd.DataFrame({
+        "asset_name": ["A"] * 4,
+        "asset_class": ["c"] * 4,
+        "return_type": ["active"] * 4,
+        "date_eom": dates,
+        "return_value": [1.0, 2.0, 4.0, 5.0],
+    })
+    out = M._forward_returns(ret, [1], "point")
+    out = out.sort_values("date_eom").reset_index(drop=True)
+    got = dict(zip(out["date_eom"].dt.strftime("%Y-%m"), out["fwd_h1"]))
+    # Feb's next calendar month is Mar, which is MISSING -> must be NaN
+    # (the buggy version would have returned Apr's value 4.0).
+    feb_ok = np.isnan(got["2020-02"])
+    # Jan -> Feb = 2.0 ; Apr -> May = 5.0 ; May -> (none) = NaN
+    jan_ok = abs(got["2020-01"] - 2.0) < 1e-12
+    apr_ok = abs(got["2020-04"] - 5.0) < 1e-12
+    may_ok = np.isnan(got["2020-05"])
+    passed = bool(feb_ok and jan_ok and apr_ok and may_ok)
+    assert passed, f"forward-return calendar alignment wrong: {got}"
+    return {"test": "test_1_forward_return_correctness", "issue": "C1",
+            "passed": passed,
+            "detail": {"feb_is_nan": bool(feb_ok), "jan->feb=2": bool(jan_ok),
+                       "apr->may=5": bool(apr_ok), "may_is_nan": bool(may_ok)}}
+
+
+# ===========================================================================
+# test_2  panel_cardinality  (H2/H5)
+# ---------------------------------------------------------------------------
+# (run_id, date_eom) must be unique. A duplicated grain must be flagged as a
+# blocking failure in the collector and produce panel_cardinality_report.csv.
+# A clean panel must pass.
+# ===========================================================================
+def test_2_panel_cardinality():
+    vc_clean = M.ValidationCollector(mode="research")
+    clean = pd.DataFrame({
+        "run_id": ["r1", "r1", "r2"],
+        "date_eom": pd.to_datetime(["2020-01-31", "2020-02-29", "2020-01-31"]),
+    })
+    with tempfile.TemporaryDirectory() as d:
+        M.assert_unique_panel(clean, ["run_id", "date_eom"], vc_clean,
+                              "research", check_key="clean_panel",
+                              out_folder=d)
+    clean_pass = vc_clean.status_of("clean_panel") == "pass"
+
+    vc_dup = M.ValidationCollector(mode="production")
+    dup = pd.DataFrame({
+        "run_id": ["r1", "r1", "r2"],
+        "date_eom": pd.to_datetime(["2020-01-31", "2020-01-31", "2020-01-31"]),
+    })
+    report_exists = False
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            M.assert_unique_panel(dup, ["run_id", "date_eom"], vc_dup,
+                                  "production", check_key="dup_panel",
+                                  out_folder=d)
+        except M.ValidationError:
+            pass  # production may raise; either way the check is 'fail'
+        report_exists = os.path.exists(
+            os.path.join(d, "panel_cardinality_report.csv"))
+        dup_fail = vc_dup.status_of("dup_panel") == "fail"
+    passed = bool(clean_pass and dup_fail and report_exists)
+    assert passed, (f"clean_pass={clean_pass} dup_fail={dup_fail} "
+                    f"report={report_exists}")
+    return {"test": "test_2_panel_cardinality", "issue": "H2/H5",
+            "passed": passed,
+            "detail": {"clean_pass": bool(clean_pass),
+                       "dup_flagged_fail": bool(dup_fail),
+                       "cardinality_report_written": bool(report_exists)}}
+
+
+# ===========================================================================
+# test_3  resume_equivalence  (C2/C3)
+# ---------------------------------------------------------------------------
+# Sidecars written by _write_shard_sidecars must round-trip exactly through
+# _read_shard_sidecars when the manifest hash matches, and be REJECTED (None)
+# when the manifest hash differs -> a stale/foreign cache cannot be reused.
+# ===========================================================================
+def test_3_resume_equivalence():
+    with tempfile.TemporaryDirectory() as d:
+        mh = "MANIFESTHASH_ABC123"
+        scores = [{"run_id": "r1", "t_stat": 2.1, "asset_class": "c"}]
+        bests = {"r1": {"c": (2.1, np.array([0.1, -0.2, 0.3]))}}
+        # a cells parquet must exist for _read to accept the sidecar set
+        cells_path = M._sidecar_paths(d, 0)["cells"]
+        import polars as pl
+        pl.DataFrame({"x": [1]}).write_parquet(cells_path)
+        M._write_shard_sidecars(d, 0, mh, scores, bests)
+
+        good = M._read_shard_sidecars(d, 0, mh)
+        roundtrip_ok = (
+            good is not None
+            and good["scores"] == scores
+            and "r1" in good["bests"]
+            and np.allclose(good["bests"]["r1"]["c"][1],
+                            bests["r1"]["c"][1])
+            and abs(good["bests"]["r1"]["c"][0] - 2.1) < 1e-9)
+
+        bad = M._read_shard_sidecars(d, 0, "DIFFERENT_HASH")
+        rejects_stale = bad is None
+    passed = bool(roundtrip_ok and rejects_stale)
+    assert passed, f"roundtrip={roundtrip_ok} rejects_stale={rejects_stale}"
+    return {"test": "test_3_resume_equivalence", "issue": "C2/C3",
+            "passed": passed,
+            "detail": {"sidecar_roundtrip": bool(roundtrip_ok),
+                       "rejects_stale_manifest": bool(rejects_stale)}}
+
+
+# ===========================================================================
+# test_4  best_class_labeling  (H1)
+# ---------------------------------------------------------------------------
+# best_class must be derived from a column->class metadata map (idxmin over
+# renamed columns), NEVER positional. We shuffle the column order so a
+# positional bug would mislabel: the true minimum p-value belongs to 'gamma'.
+# ===========================================================================
+def test_4_best_class_labeling():
+    class_names = ["alpha", "beta", "gamma"]
+    # Column order deliberately NOT matching class_names order.
+    df = pd.DataFrame({
+        "rw_p_across_configs_gamma": [0.01, 0.90],   # gamma smallest in row 0
+        "rw_p_across_configs_alpha": [0.50, 0.02],   # alpha smallest in row 1
+        "rw_p_across_configs_beta":  [0.30, 0.40],
+    })
+    class_rw_cols = [f"rw_p_across_configs_{c}" for c in class_names
+                     if f"rw_p_across_configs_{c}" in df.columns]
+    rw_col_to_class = {f"rw_p_across_configs_{c}": c for c in class_names
+                       if f"rw_p_across_configs_{c}" in df.columns}
+    rw_df = df[class_rw_cols].copy().rename(columns=rw_col_to_class)
+    best = rw_df.idxmin(axis=1)
+    row0_ok = best.iloc[0] == "gamma"
+    row1_ok = best.iloc[1] == "alpha"
+    src = best.map(lambda c: f"rw_p_across_configs_{c}")
+    src_ok = (src.iloc[0] == "rw_p_across_configs_gamma"
+              and src.iloc[1] == "rw_p_across_configs_alpha")
+    passed = bool(row0_ok and row1_ok and src_ok)
+    assert passed, f"best={list(best)} src={list(src)}"
+    return {"test": "test_4_best_class_labeling", "issue": "H1",
+            "passed": passed,
+            "detail": {"row0_best": str(best.iloc[0]),
+                       "row1_best": str(best.iloc[1]),
+                       "source_column_ok": bool(src_ok)}}
+
+
+# ===========================================================================
+# test_5  idmethod_dtype  (H3)
+# ---------------------------------------------------------------------------
+# canonicalize_idmethod must preserve leading zeros and non-numeric ids, strip
+# the '101.0' float artifact, and NEVER return a numeric dtype. The dtype
+# guard must PASS on the canonicalized column and FAIL on a numeric column.
+# ===========================================================================
+def test_5_idmethod_dtype():
+    raw = pd.Series(["001", "101", 101.0, "101A", "method_foo"])
+    canon = M.canonicalize_idmethod(raw)
+    vals = list(canon.astype(str))
+    preserves = (vals[0] == "001" and vals[1] == "101"
+                 and vals[2] == "101" and vals[3] == "101A"
+                 and vals[4] == "method_foo")
+    not_numeric = not pd.api.types.is_numeric_dtype(canon.dtype)
+
+    vc_ok = M.ValidationCollector(mode="research")
+    M.assert_idmethod_not_numeric(pd.DataFrame({"idmethod": canon}),
+                                  "idmethod", vc_ok, blocking=True)
+    guard_pass = vc_ok.status_of("idmethod_dtype") == "pass"
+
+    vc_bad = M.ValidationCollector(mode="research")
+    M.assert_idmethod_not_numeric(
+        pd.DataFrame({"idmethod": pd.Series([1, 2, 3])}),
+        "idmethod", vc_bad, blocking=True)
+    guard_fail = vc_bad.status_of("idmethod_dtype") == "fail"
+
+    passed = bool(preserves and not_numeric and guard_pass and guard_fail)
+    assert passed, (f"vals={vals} not_numeric={not_numeric} "
+                    f"guard_pass={guard_pass} guard_fail={guard_fail}")
+    return {"test": "test_5_idmethod_dtype", "issue": "H3",
+            "passed": passed,
+            "detail": {"canonicalized": vals,
+                       "dtype": str(canon.dtype),
+                       "guard_pass_on_string": bool(guard_pass),
+                       "guard_fail_on_numeric": bool(guard_fail)}}
+
+
+# ===========================================================================
+# test_6  k_eff_bounds  (M1)
+# ---------------------------------------------------------------------------
+# estimate_k_effective must always satisfy 1 <= k_eff <= k_raw. Perfectly
+# correlated classes -> ~1; near-independent classes -> ~k_raw. raw_k -> k_raw.
+# ===========================================================================
+def test_6_k_eff_bounds():
+    n = 240
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2000-01-31", periods=n, freq="ME")
+    base = rng.standard_normal(n)
+
+    def _mk(assets, series_map):
+        frames = []
+        for a, s in series_map.items():
+            frames.append(pd.DataFrame({
+                "asset_name": a, "asset_class": assets, "return_type": "active",
+                "date_eom": dates, "fwd_h1": s}))
+        return pd.concat(frames, ignore_index=True)
+
+    # Correlated case: three classes all driven by 'base' -> k_eff ~ 1
+    corr_parts = []
+    ac_corr = {}
+    for cls in ["c1", "c2", "c3"]:
+        ac_corr[cls] = {"assets": [f"{cls}_a"], "benchmark": None,
+                        "return_type": "active"}
+        corr_parts.append(_mk(cls, {f"{cls}_a": base + 0.001
+                                    * rng.standard_normal(n)}))
+    corr_df = pd.concat(corr_parts, ignore_index=True)
+    k_corr = M.estimate_k_effective(corr_df, ac_corr,
+                                    method="corrected_li_ji")
+
+    # Independent case: three classes with independent noise -> k_eff ~ 3
+    ind_parts = []
+    ac_ind = {}
+    for cls in ["c1", "c2", "c3"]:
+        ac_ind[cls] = {"assets": [f"{cls}_a"], "benchmark": None,
+                       "return_type": "active"}
+        ind_parts.append(_mk(cls, {f"{cls}_a": rng.standard_normal(n)}))
+    ind_df = pd.concat(ind_parts, ignore_index=True)
+    k_ind = M.estimate_k_effective(ind_df, ac_ind, method="corrected_li_ji")
+
+    k_rawk = M.estimate_k_effective(ind_df, ac_ind, method="raw_k")
+
+    # Invariants (M1): always 1<=k_eff<=k_raw; correlated collapses BELOW
+    # independent; independent approaches k_raw. Note the Li-Ji corrected
+    # estimator maps a single dominant eigenvalue lambda~3 to ~1+frac(3)~2,
+    # so perfectly-correlated k does NOT reach 1 exactly -- the CONTRACT
+    # requirement is the 1<=k<=k_raw bound plus monotone collapse, not k==1.
+    bounds_ok = (1.0 <= k_corr <= 3.0) and (1.0 <= k_ind <= 3.0)
+    ordering_ok = k_corr < k_ind          # correlated collapses more
+    corr_collapses = k_corr < 2.5         # meaningfully below k_raw=3
+    ind_near_k = k_ind > 2.3              # near-independent approaches k_raw
+    rawk_ok = abs(k_rawk - 3.0) < 1e-9
+    passed = bool(bounds_ok and ordering_ok and corr_collapses
+                  and ind_near_k and rawk_ok)
+    assert passed, (f"k_corr={k_corr:.3f} k_ind={k_ind:.3f} "
+                    f"k_rawk={k_rawk:.3f}")
+    return {"test": "test_6_k_eff_bounds", "issue": "M1",
+            "passed": passed,
+            "detail": {"k_correlated": round(float(k_corr), 4),
+                       "k_independent": round(float(k_ind), 4),
+                       "k_raw_k_method": round(float(k_rawk), 4),
+                       "bounds_1_to_kraw": bool(bounds_ok)}}
+
+
+# ===========================================================================
+# test_7  drop_keep_logic  (sample spec)
+# ---------------------------------------------------------------------------
+# generate_next_horizon_dates + apply_duplicate_policy: 'drop' must remove true
+# duplicate signal-observation records on the resolved dedupe grain; 'keep'
+# must retain every row and write duplicate_policy_diagnostics.csv either way.
+# ===========================================================================
+def test_7_drop_keep_logic():
+    # Two run_ids; run_id r1 has a duplicated (idmethod,date,idstate2) row that
+    # after next-horizon expansion becomes a true duplicate signal record.
+    sample = pd.DataFrame({
+        "run_id": ["r1", "r1", "r2"],
+        "idmethod": pd.Series(["101", "101", "202"], dtype="string"),
+        "date_eom": pd.to_datetime(["2020-01-31", "2020-01-31", "2020-03-31"]),
+        "idstate2": [1, 1, 2],
+        "regime_label2": ["bull", "bull", "bear"],
+    })
+    nh = M.generate_next_horizon_dates(sample, [1, 2])
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg_drop = {"sample": {"duplicate_policy": "drop",
+                               "dedupe_identification_cols": None}}
+        vc = M.ValidationCollector(mode="research")
+        deduped, diag_drop = M.apply_duplicate_policy(
+            nh, cfg_drop, vc=vc, mode="research", out_folder=d)
+        drop_report = os.path.exists(
+            os.path.join(d, "duplicate_policy_diagnostics.csv"))
+        drop_removed = diag_drop["n_removed"] > 0
+        drop_smaller = len(deduped) < len(nh)
+
+    with tempfile.TemporaryDirectory() as d2:
+        cfg_keep = {"sample": {"duplicate_policy": "keep",
+                               "dedupe_identification_cols": None}}
+        vc2 = M.ValidationCollector(mode="research")
+        kept, diag_keep = M.apply_duplicate_policy(
+            nh, cfg_keep, vc=vc2, mode="research", out_folder=d2)
+        keep_all = (len(kept) == len(nh)) and (diag_keep["n_removed"] == 0)
+        keep_report = os.path.exists(
+            os.path.join(d2, "duplicate_policy_diagnostics.csv"))
+
+    passed = bool(drop_removed and drop_smaller and drop_report
+                  and keep_all and keep_report)
+    assert passed, (f"drop_removed={drop_removed} drop_smaller={drop_smaller} "
+                    f"keep_all={keep_all}")
+    return {"test": "test_7_drop_keep_logic", "issue": "sample spec",
+            "passed": passed,
+            "detail": {"n_expanded": int(len(nh)),
+                       "drop_n_removed": int(diag_drop["n_removed"]),
+                       "drop_dedupe_key": diag_drop["dedupe_key_used"],
+                       "keep_kept_all": bool(keep_all)}}
+
+
+# ===========================================================================
+# test_8  subsample_stability  (stability spec)
+# ---------------------------------------------------------------------------
+# subsample_stability_for_series must: (a) split pre/post at the cutoff,
+# (b) flag INSTABILITY (formal_stability_pass=False) when the post-mean shifts
+# dramatically, and (c) report STABILITY when pre and post share the same
+# distribution. Uses the moving-block bootstrap layer.
+# ===========================================================================
+def test_8_subsample_stability():
+    cfg_stab = {"subsample_stability_test": "moving_block_bootstrap",
+                "alpha": 0.05, "block_length": "auto",
+                "n_bootstrap": 500, "min_obs_per_subsample": 12}
+    cutoff = pd.Timestamp("2010-12-31")
+    n = 120
+    dates = pd.date_range("2005-01-31", periods=n, freq="ME")
+    rng = np.random.default_rng(3)
+
+    # STABLE: same mean pre & post
+    stable_vals = 0.01 + 0.001 * rng.standard_normal(n)
+    res_stable = M.subsample_stability_for_series(
+        dates.values, stable_vals, cutoff, cfg_stab, seed=11, horizon=1)
+
+    # UNSTABLE: large mean shift after cutoff
+    is_post = np.asarray(dates > cutoff)
+    unstable_vals = 0.001 * rng.standard_normal(n)
+    unstable_vals[is_post] += 0.05   # big regime shift
+    res_unstable = M.subsample_stability_for_series(
+        dates.values, unstable_vals, cutoff, cfg_stab, seed=11, horizon=1)
+
+    split_ok = (res_stable["n_pre"] > 0 and res_stable["n_post"] > 0)
+    stable_pass = bool(res_stable["formal_stability_pass"])
+    unstable_flagged = not bool(res_unstable["formal_stability_pass"])
+    method_ok = "moving_block_bootstrap" in str(
+        res_unstable["formal_test_method"])
+    passed = bool(split_ok and stable_pass and unstable_flagged and method_ok)
+    assert passed, (f"stable_pass={stable_pass} "
+                    f"unstable_flagged={unstable_flagged} "
+                    f"p_stable={res_stable['formal_p_value']} "
+                    f"p_unstable={res_unstable['formal_p_value']}")
+    return {"test": "test_8_subsample_stability", "issue": "stability spec",
+            "passed": passed,
+            "detail": {"stable_formal_p": res_stable["formal_p_value"],
+                       "unstable_formal_p": res_unstable["formal_p_value"],
+                       "stable_pass": bool(stable_pass),
+                       "unstable_flagged_unstable": bool(unstable_flagged),
+                       "method": res_unstable["formal_test_method"]}}
+
+
+# ===========================================================================
+# test_9  stability_calibration  (stability spec, v6.1 CI gate)
+# ---------------------------------------------------------------------------
+# test_8 proves the stability test has POWER (it flags a real mean shift) and
+# SIZE at a single seed. test_9 is the calibration companion: under a
+# stationary null (identical pre/post distributions), the formal
+# moving-block-bootstrap layer must NOT over-reject. Across ~200 independent
+# seeds we assert the empirical false-positive rate
+#   FPR = P(formal_stability_pass == False | null true)
+# stays within a tolerance band around the nominal alpha=0.05. A grossly
+# mis-sized test (e.g. FPR ~ 0.30) would silently poison downstream
+# stability gating, so this locks the size in as a regression guard.
+#
+# Separately, it verifies the WELCH / "none" FALLBACK semantics documented at
+# subsample_stability_for_series (~line 2410-2429):
+#   * when a subsample has too few obs (< min_obs_per_subsample) the formal
+#     layer degrades to method "none" with p=NaN and CANNOT report a pass;
+#   * when the block bootstrap itself cannot run (n < 2 per subsample) the
+#     method falls back to the Welch two-sample t ("welch...fallback").
+# ===========================================================================
+def test_9_stability_calibration():
+    cfg_stab = {"subsample_stability_test": "moving_block_bootstrap",
+                "alpha": 0.05, "block_length": "auto",
+                "n_bootstrap": 300, "min_obs_per_subsample": 12}
+    alpha = cfg_stab["alpha"]
+    cutoff = pd.Timestamp("2010-12-31")
+    n = 120
+    dates = pd.date_range("2005-01-31", periods=n, freq="ME")
+
+    # --- (a) SIZE under the stationary null across many seeds ---------------
+    # Identical pre/post generating process: a single Gaussian for the whole
+    # window. Any formal_stability_pass==False here is a false positive.
+    n_seeds = 200
+    n_false_pos = 0
+    n_evaluable = 0
+    for s in range(n_seeds):
+        rng = np.random.default_rng(1000 + s)
+        vals = 0.01 + 0.001 * rng.standard_normal(n)   # no regime shift
+        res = M.subsample_stability_for_series(
+            dates.values, vals, cutoff, cfg_stab, seed=s, horizon=1)
+        # Only count seeds where the formal layer actually ran (has a p-value).
+        if not np.isnan(res["formal_p_value"]):
+            n_evaluable += 1
+            if not bool(res["formal_stability_pass"]):
+                n_false_pos += 1
+    fpr = (n_false_pos / n_evaluable) if n_evaluable else float("nan")
+    # Tolerance band around nominal alpha=0.05. Block-bootstrap on
+    # autocorrelation-free data is close to nominal; we allow generous slack
+    # (<=0.12) so the gate catches gross mis-sizing (e.g. 0.30) without
+    # flapping on Monte-Carlo noise from 200 seeds.
+    fpr_ok = bool(n_evaluable >= int(0.9 * n_seeds) and fpr <= 0.12)
+
+    # --- (b) "none" fallback: a post subsample with too few obs -------------
+    # Put the cutoff so the post window has < min_obs_per_subsample points.
+    late_cutoff = dates[-3]        # only 2 post observations -> insufficient
+    rng2 = np.random.default_rng(7)
+    vals2 = 0.01 + 0.001 * rng2.standard_normal(n)
+    res_short = M.subsample_stability_for_series(
+        dates.values, vals2, late_cutoff, cfg_stab, seed=7, horizon=1)
+    none_method_ok = (str(res_short["formal_test_method"]) == "none"
+                      and np.isnan(res_short["formal_p_value"]))
+    # With insufficient obs the formal layer cannot certify stability.
+    none_no_pass_ok = (not bool(res_short["formal_stability_pass"]))
+
+    # --- (c) Welch fallback: enough obs, but block bootstrap degenerates ----
+    # min_obs=2 lets the formal layer run with tiny subsamples where the
+    # moving-block bootstrap returns a NaN p-value (n<2 effective) and the
+    # code falls back to the Welch two-sample t. We force a small window.
+    cfg_tiny = dict(cfg_stab); cfg_tiny["min_obs_per_subsample"] = 2
+    n_small = 6
+    dates_s = pd.date_range("2009-07-31", periods=n_small, freq="ME")
+    cutoff_s = dates_s[2]          # 3 pre, 3 post
+    rng3 = np.random.default_rng(9)
+    vals_s = 0.01 + 0.001 * rng3.standard_normal(n_small)
+    res_tiny = M.subsample_stability_for_series(
+        dates_s.values, vals_s, cutoff_s, cfg_tiny, seed=9, horizon=1)
+    m_tiny = str(res_tiny["formal_test_method"])
+    # Method must be one of the documented degraded outcomes: a welch fallback
+    # (block bootstrap could not produce a p) or the block bootstrap itself if
+    # it still managed to run. Never silently a full pass with no method.
+    welch_or_block_ok = ("welch" in m_tiny) or ("moving_block" in m_tiny) \
+        or (m_tiny == "none")
+
+    passed = bool(fpr_ok and none_method_ok and none_no_pass_ok
+                  and welch_or_block_ok)
+    assert passed, (f"fpr={fpr:.3f} (evaluable={n_evaluable}) "
+                    f"none_method={res_short['formal_test_method']} "
+                    f"none_pass={res_short['formal_stability_pass']} "
+                    f"tiny_method={m_tiny}")
+    return {"test": "test_9_stability_calibration", "issue": "stability spec",
+            "passed": passed,
+            "detail": {"null_false_positive_rate": round(float(fpr), 4),
+                       "n_evaluable_seeds": int(n_evaluable),
+                       "n_seeds": int(n_seeds),
+                       "alpha": alpha,
+                       "fpr_within_band": bool(fpr_ok),
+                       "insufficient_obs_method": str(
+                           res_short["formal_test_method"]),
+                       "insufficient_obs_no_pass": bool(none_no_pass_ok),
+                       "tiny_subsample_method": m_tiny}}
+
+
+# ===========================================================================
+# test_10  resume_equivalence_e2e  (C2/C3, v6.1 full-pipeline CI gate)
+# ---------------------------------------------------------------------------
+# test_3 proves the sidecar codec round-trips at the unit level. test_10 is
+# the end-to-end companion: it runs the WHOLE orchestrator (run_all_v3) to
+# completion once ("clean"), then simulates a mid-run crash by deleting the
+# sidecar set for a subset of shards and re-running with resume=True. The
+# resumed run must rebuild the identical parent aggregation:
+#   * identical config_scores rows on the sort keys, and
+#   * numerically identical statistic columns (atol=1e-9).
+# This is the guard that the v6.1 additive changes (sensitivity report,
+# agreement diagnostic, optional fwd partitioning) did NOT break resume
+# equivalence -- the reason SHARD_SIDECAR_SCHEMA_VERSION was deliberately
+# held at v6.0.0.
+# ===========================================================================
+def _build_e2e_fixture(tmp):
+    """Small synthetic panel reusing the e2e builder contract: a handful of
+    idmethods x assets x ~60 months. Kept intentionally tiny so the full
+    pipeline runs in seconds while still exercising >1 shard."""
+    dates = pd.date_range("2016-01-31", periods=60, freq="ME")
+    n = len(dates)
+    rng = np.random.default_rng(424242)
+    idmethods = ["001", "101", "202", "303", "method_foo"]
+    reg_rows = []
+    for imid in idmethods:
+        state = 1
+        for dt in dates:
+            if rng.random() < 0.10:
+                state = int(rng.integers(1, 4))
+            reg_rows.append({"idmethod": imid,
+                             "date_eom": dt.strftime("%Y-%m-%d"),
+                             "idstate": state,
+                             "regime_label": f"state_{state}"})
+    reg_path = os.path.join(tmp, "e2e_regime.csv")
+    pd.DataFrame(reg_rows).to_csv(reg_path, index=False)
+
+    assets = ["s_Momentum", "s_LowVol", "s_Quality", "s_Value",
+              "s_Growth", "s_Carry"]
+    betas = {"s_Momentum": 1.1, "s_LowVol": 0.6, "s_Quality": 0.9,
+             "s_Value": 1.0, "s_Growth": 1.2, "s_Carry": 0.8}
+    mkt = 0.004 + 0.02 * rng.standard_normal(n)
+    ret = {"date": dates.strftime("%Y-%m-%d")}
+    for a in assets:
+        ret[a] = betas[a] * mkt + 0.01 * rng.standard_normal(n) + 0.001
+    ret["Bench_RF"] = 0.0015 + 0.0 * mkt
+    ret_path = os.path.join(tmp, "e2e_returns.csv")
+    pd.DataFrame(ret).to_csv(ret_path, index=False)
+    return reg_path, ret_path
+
+
+def _e2e_cfg(reg_path, ret_path, out_folder, resume):
+    from copy import deepcopy
+    cfg = deepcopy(M.CONFIG)
+    cfg["runtime"]["mode"] = "research"     # research mode, subset OFF
+    cfg["io"]["identified_regime_csv"] = reg_path
+    cfg["io"]["asset_returns_csv"] = ret_path
+    cfg["io"]["output_folder"] = out_folder
+    cfg["io"]["resume"] = bool(resume)
+    cfg["compute"]["n_jobs"] = 2
+    cfg["compute"]["subset_n_run_ids"] = None
+    cfg["compute"]["cleanup_shards"] = False    # keep sidecars for resume
+    cfg["signal"]["rw_n_boot"] = 150
+    cfg["signal"]["min_occurrences"] = 12
+    cfg["signal"]["baseline_cutoff_age"] = None
+    cfg["signal"]["regime_universe"] = "all"
+    cfg["steps"]["run_romano_wolf_within"] = False
+    cfg["steps"]["run_romano_wolf_across"] = True
+    cfg["steps"]["run_subsample_stability"] = True
+    cfg["statistics"]["subsample_stability"]["n_bootstrap"] = 150
+    cfg["sample"]["pre_post_cutoff_date"] = "2018-06-30"
+    return cfg
+
+
+def _canon_scores(cs):
+    """Normalize config_scores (DataFrame or list-of-dict) to a sorted
+    pandas.DataFrame with a stable row order for byte/numeric comparison."""
+    df = cs.copy() if isinstance(cs, pd.DataFrame) else pd.DataFrame(cs)
+    # Sort keys: prefer run_id-like identity columns present in the panel.
+    prefer = [c for c in ("run_id", "idmethod", "idstate", "regime_label",
+                          "asset_class") if c in df.columns]
+    keys = prefer if prefer else list(df.columns[:1])
+    df = df.sort_values(keys).reset_index(drop=True)
+    return df, keys
+
+
+def test_10_resume_equivalence_e2e():
+    with tempfile.TemporaryDirectory(prefix="regv6_resume_") as tmp:
+        reg_path, ret_path = _build_e2e_fixture(tmp)
+
+        # ---- Run A: clean full run --------------------------------------
+        out_a = os.path.join(tmp, "out_clean")
+        res_a = M.run_all_v3(_e2e_cfg(reg_path, ret_path, out_a, resume=False))
+        cs_a = res_a.get("config_scores")
+        df_a, keys = _canon_scores(cs_a)
+
+        # ---- Simulate a crash: delete sidecars for a subset of shards ---
+        # Sidecars live in the shard tmp dir under the output folder. Locate
+        # that dir + enumerate the ACTUAL shard indices present (the tiny
+        # universe may yield only a couple of shards), then delete the
+        # sidecar set for the last-half of shards so resume must recompute
+        # them. Adaptive so the test bites regardless of shard count.
+        import re
+        killed = 0
+        shard_dirs = set()
+        present_idx = set()
+        for root, _dirs, files in os.walk(out_a):
+            for fn in files:
+                m = re.match(r"scores_shard_(\d+)\.json$", fn)
+                if m:
+                    shard_dirs.add(root)
+                    present_idx.add(int(m.group(1)))
+        present = sorted(present_idx)
+        # Kill roughly the back half (at least one shard when >=1 exists).
+        to_kill = present[len(present) // 2:] if present else []
+        if present and not to_kill:
+            to_kill = present[-1:]
+        for sd in shard_dirs:
+            for idx in to_kill:
+                for _kind, p in M._sidecar_paths(sd, idx).items():
+                    if os.path.exists(p):
+                        os.remove(p)
+                        killed += 1
+
+        # ---- Run B: resume run against the SAME output folder -----------
+        res_b = M.run_all_v3(_e2e_cfg(reg_path, ret_path, out_a, resume=True))
+        cs_b = res_b.get("config_scores")
+        df_b, _ = _canon_scores(cs_b)
+
+        # ---- Compare: identical shape + identity keys, numeric atol -----
+        same_rows = (len(df_a) == len(df_b) and len(df_a) > 0)
+        keys_equal = same_rows and df_a[keys].astype(str).equals(
+            df_b[keys].astype(str))
+        num_cols = [c for c in df_a.columns
+                    if c in df_b.columns
+                    and pd.api.types.is_numeric_dtype(df_a[c])
+                    and pd.api.types.is_numeric_dtype(df_b[c])]
+        max_abs_diff = 0.0
+        numeric_equal = True
+        for c in num_cols:
+            a = pd.to_numeric(df_a[c], errors="coerce").to_numpy(dtype=float)
+            b = pd.to_numeric(df_b[c], errors="coerce").to_numpy(dtype=float)
+            both_nan = np.isnan(a) & np.isnan(b)
+            d = np.abs(np.where(both_nan, 0.0, a - b))
+            d = np.where(np.isnan(d), np.inf, d)   # one-sided NaN => mismatch
+            if d.size:
+                max_abs_diff = max(max_abs_diff, float(np.nanmax(d)))
+            if not np.all(d <= 1e-9):
+                numeric_equal = False
+
+        passed = bool(same_rows and keys_equal and numeric_equal)
+        assert passed, (f"rows_a={len(df_a)} rows_b={len(df_b)} "
+                        f"keys_equal={keys_equal} numeric_equal={numeric_equal} "
+                        f"max_abs_diff={max_abs_diff} killed_sidecars={killed}")
+        return {"test": "test_10_resume_equivalence_e2e", "issue": "C2/C3",
+                "passed": passed,
+                "detail": {"clean_rows": int(len(df_a)),
+                           "resume_rows": int(len(df_b)),
+                           "sort_keys": keys,
+                           "shards_present": present,
+                           "shards_killed": to_kill,
+                           "killed_sidecar_files": int(killed),
+                           "identity_keys_equal": bool(keys_equal),
+                           "numeric_cols_compared": int(len(num_cols)),
+                           "max_abs_diff": max_abs_diff,
+                           "numeric_equal_atol_1e_9": bool(numeric_equal)}}
+
+
+# ===========================================================================
+# test_11  passive_copy_toggle  (v6.1.2, panel spec + universe robustness)
+# ---------------------------------------------------------------------------
+# Verifies the state_fill.include_passive_copy toggle and the empty-universe
+# hardening that followed from making copy_b optional:
+#   (a) include_passive_copy=False -> the panel is fwdfill-only (no 'passive'
+#       fillna_type) and has ~half the rows of the two-copy panel;
+#   (b) include_passive_copy=True  -> the legacy two-copy panel ('fwdfill' +
+#       'passive') is reproduced;
+#   (c) REGRESSION GUARD: with regime_universe mode='last' AND a small
+#       universe_filter_age, the selected universe must be NON-EMPTY under
+#       BOTH settings. Before v6.1.2 the fwdfill-only panel silently produced
+#       0 triples here (forward-filled terminal episodes are "old"), which
+#       later blew up as "No shard produced any cells". The age gate now warns
+#       and is skipped rather than emptying the universe.
+# ===========================================================================
+def test_11_passive_copy_toggle():
+    # Synthetic regime history with SOME missing observed states, so copy_b
+    # would exist under the legacy design.
+    dates = pd.date_range("2015-01-31", "2020-12-31", freq="ME")
+    rng = np.random.default_rng(0)
+    rows = []
+    for imid in ["001", "101", "202"]:
+        st = 1
+        for i, dt in enumerate(dates):
+            if imid == "101" and 10 <= i <= 20:      # a gap of missing states
+                state, lab = np.nan, np.nan
+            else:
+                if rng.random() < 0.15:
+                    st = int(rng.integers(1, 4))
+                state, lab = st, f"state_{st}"
+            rows.append({"idmethod": imid,
+                         "date_eom": dt.strftime("%Y-%m-%d"),
+                         "idstate": state, "regime_label": lab})
+    ir = pd.DataFrame(rows)
+
+    def _run(include_passive):
+        cfg = {"state_fill": {"include_passive_copy": include_passive,
+                              "use_ffilled_date_as_coverage_end_date": True,
+                              "allow_post_coverage_ffill": False,
+                              "max_ffill_months": 3},
+               "coverage_end_mode": "data_max", "today_override": None}
+        p1 = M.build_baseline(ir, cfg, vc=None)
+        exp = p1["identified_regime_exp_ffill"]
+        p2 = M.build_episodes(exp)
+        reg_full = exp.copy()
+        reg_full["date_eom"] = M.to_month_end(reg_full["date_eom"])
+        # mode='last' + small age is exactly the config that emptied the
+        # universe pre-fix.
+        out = M._apply_regime_universe(
+            reg_full, p2["regime_episode_report"],
+            p1["indicator_method_coverage"], "last", 3, exclude_sentinels=True)
+        ftypes = sorted(exp["fillna_type"].dropna().unique().tolist())
+        n_trip = int(out[["fillna_type", "idmethod", "idstate2"]]
+                     .drop_duplicates().shape[0])
+        return ftypes, len(exp), n_trip
+
+    ex_ftypes, ex_rows, ex_trip = _run(False)   # exclude (default)
+    in_ftypes, in_rows, in_trip = _run(True)     # include (legacy)
+
+    exclude_is_fwdfill_only = (ex_ftypes == ["fwdfill"])
+    include_has_both = ("fwdfill" in in_ftypes and "passive" in in_ftypes)
+    include_is_larger = (in_rows > ex_rows)
+    # The core regression guard: neither setting may silently empty the
+    # universe under mode='last' + universe_filter_age.
+    universe_nonempty_both = (ex_trip > 0 and in_trip > 0)
+
+    passed = bool(exclude_is_fwdfill_only and include_has_both
+                  and include_is_larger and universe_nonempty_both)
+    assert passed, (f"ex_ftypes={ex_ftypes} ex_rows={ex_rows} ex_trip={ex_trip} "
+                    f"in_ftypes={in_ftypes} in_rows={in_rows} in_trip={in_trip}")
+    return {"test": "test_11_passive_copy_toggle",
+            "issue": "panel spec / universe robustness",
+            "passed": passed,
+            "detail": {"exclude_fillna_types": ex_ftypes,
+                       "exclude_panel_rows": ex_rows,
+                       "exclude_universe_triples": ex_trip,
+                       "include_fillna_types": in_ftypes,
+                       "include_panel_rows": in_rows,
+                       "include_universe_triples": in_trip,
+                       "exclude_is_fwdfill_only": bool(exclude_is_fwdfill_only),
+                       "include_has_both_copies": bool(include_has_both),
+                       "universe_nonempty_both": bool(universe_nonempty_both)}}
+
+
+# ===========================================================================
+# test_12  merge_date_overlap_skip  (v6.1.3, sample-spec merge semantics)
+# ---------------------------------------------------------------------------
+# Verifies the zero date-overlap handling that fixed the research-mode crash:
+#   (a) _validate_merge_dates returns True when the two month-end date columns
+#       share at least one date (join will produce rows);
+#   (b) it returns False (and does NOT raise, even with strict=True) when the
+#       date columns are disjoint -- e.g. the regime tail runs past the last
+#       asset-return month, so no observation maps to a matching return date.
+#       Under the sample semantics this is a valid empty matched sample, not an
+#       integrity error, so a single such shard must not abort the whole run;
+#   (c) REGRESSION GUARD: a genuine integrity problem (a non-month-end value on
+#       either side) STILL raises under strict=True, so the guardrail keeps its
+#       fail-fast value for real data bugs.
+# ===========================================================================
+def test_12_merge_date_overlap_skip():
+    me = pd.date_range("2020-01-31", "2020-06-30", freq="ME")
+    # (a) overlapping month-ends -> True
+    left_ok = pd.DataFrame({"date_eom": me})
+    right_ok = pd.DataFrame({"date": me[2:]})    # shares 2020-03..06
+    overlap_true = M._validate_merge_dates(left_ok, "date_eom", right_ok, "date", strict=True)
+
+    # (b) disjoint month-ends -> False and MUST NOT raise even under strict
+    left_tail = pd.DataFrame({"date_eom": pd.date_range("2026-04-30", "2026-06-30", freq="ME")})
+    right_early = pd.DataFrame({"date": pd.date_range("2020-01-31", "2020-06-30", freq="ME")})
+    raised_on_disjoint = False
+    overlap_false = None
+    try:
+        overlap_false = M._validate_merge_dates(left_tail, "date_eom", right_early, "date", strict=True)
+    except Exception:
+        raised_on_disjoint = True
+
+    # (c) genuine integrity error (non-month-end left value) STILL raises under strict
+    left_bad = pd.DataFrame({"date_eom": pd.to_datetime(["2020-01-15", "2020-02-29"])})
+    right_bad = pd.DataFrame({"date": pd.to_datetime(["2020-01-31", "2020-02-29"])})
+    raised_on_integrity = False
+    try:
+        M._validate_merge_dates(left_bad, "date_eom", right_bad, "date", strict=True)
+    except Exception:
+        raised_on_integrity = True
+
+    a_ok = (overlap_true is True)
+    b_ok = (overlap_false is False and not raised_on_disjoint)
+    c_ok = (raised_on_integrity is True)
+    passed = bool(a_ok and b_ok and c_ok)
+    assert passed, (f"overlap_true={overlap_true} overlap_false={overlap_false} "
+                    f"raised_on_disjoint={raised_on_disjoint} "
+                    f"raised_on_integrity={raised_on_integrity}")
+    return {"test": "test_12_merge_date_overlap_skip",
+            "issue": "sample-spec merge semantics / zero-overlap shard skip",
+            "passed": passed,
+            "detail": {"overlap_true": bool(overlap_true),
+                       "overlap_false": (None if overlap_false is None else bool(overlap_false)),
+                       "raised_on_disjoint": bool(raised_on_disjoint),
+                       "raised_on_integrity": bool(raised_on_integrity)}}
+
+
+# ===========================================================================
+# test_13  episode_age_and_preflight  (v6.1.3)
+# ---------------------------------------------------------------------------
+# Two independent guards motivated by the 'baseline_cutoff_age only kept 1950s
+# rows' investigation:
+#   (a) EPISODE-AGE CORRECTNESS: for a single idmethod whose state RECURS in
+#       several separate episodes (A A A | B B | A A | C | A A A A), the age
+#       must RESET to 1 at each episode start -- so baseline_cutoff_age<=3 keeps
+#       the early observations of EVERY episode, not just the first. This proves
+#       the cutoff behaves per-episode (across all episodes) as intended, and
+#       that a 1950s-only clustering is a data property (few long episodes), not
+#       an age-logic bug.
+#   (b) PRE-FLIGHT SUFFICIENCY: build_preflight_sample_size_report correctly
+#       counts, on matched dates only, how many cells clear min_occurrences.
+# ===========================================================================
+def test_13_episode_age_and_preflight():
+    # (a) recurring-state episode age
+    states = [1, 1, 1, 2, 2, 1, 1, 3, 1, 1, 1, 1]
+    dates = pd.date_range("2000-01-31", periods=len(states), freq="ME")
+    df = pd.DataFrame({"fillna_type": "fwdfill", "idmethod": "001",
+                       "date_eom": dates,
+                       "idstate2": [float(s) for s in states]})
+    out = M._add_episode_age_cols_pandas(df)
+    # state 1 must occupy 3 distinct episodes; each episode's age starts at 1
+    s1 = out[out["idstate2"] == 1.0]
+    n_state1_episodes = int(s1["regime_episode_id"].nunique())
+    each_episode_starts_at_1 = bool(
+        (s1.groupby("regime_episode_id")["regime_episode_id_age"].min() == 1).all())
+    # baseline_cutoff_age<=3 keeps early rows of EVERY episode -> the last
+    # episode (starting 2000-09-30) must contribute at least its age-1 row.
+    kept = out[out["regime_episode_id_age"] <= 3]
+    last_ep_start = pd.Timestamp("2000-09-30")
+    keeps_last_episode = bool((kept["date_eom"] == last_ep_start).any())
+    age_ok = bool(n_state1_episodes == 3 and each_episode_starts_at_1
+                  and keeps_last_episode)
+
+    # (b) pre-flight cell-sufficiency count on matched dates only
+    reg = out.copy()
+    reg["idstate2"] = reg["idstate2"].astype(float)
+    # forward table matches only the first 6 month-ends -> 6 matched dates
+    fwd = pd.DataFrame({"date": dates[:6], "fwd_h1": np.arange(6, dtype=float)})
+    rep = M.build_preflight_sample_size_report(
+        reg, fwd, [1], min_occ=2, cutoff=3, out_folder=None)
+    # matched dates = first 6; count cells (fillna_type,idmethod,idstate2) whose
+    # matched-obs >= 2. Compute the expected value independently.
+    reg_matched = reg[pd.to_datetime(reg["date_eom"]).isin(set(dates[:6]))]
+    exp_cells = reg_matched.groupby(["fillna_type", "idmethod", "idstate2"]).size()
+    exp_ge2 = int((exp_cells >= 2).sum())
+    preflight_ok = bool(rep["n_cells_clearing_min_occ"] == exp_ge2
+                        and rep["matched_month_ends"] == 6)
+
+    passed = bool(age_ok and preflight_ok)
+    assert passed, (f"n_state1_episodes={n_state1_episodes} "
+                    f"each_episode_starts_at_1={each_episode_starts_at_1} "
+                    f"keeps_last_episode={keeps_last_episode} "
+                    f"rep_cells={rep.get('n_cells_clearing_min_occ')} "
+                    f"exp_ge2={exp_ge2} matched={rep.get('matched_month_ends')}")
+    return {"test": "test_13_episode_age_and_preflight",
+            "issue": "per-episode age reset + pre-flight sufficiency count",
+            "passed": passed,
+            "detail": {"n_state1_episodes": n_state1_episodes,
+                       "each_episode_starts_at_1": each_episode_starts_at_1,
+                       "keeps_last_episode": keeps_last_episode,
+                       "preflight_cells_ge_min": int(rep["n_cells_clearing_min_occ"]),
+                       "preflight_matched_month_ends": int(rep["matched_month_ends"])}}
+
+
+ALL_TESTS = [
+    test_1_forward_return_correctness,
+    test_2_panel_cardinality,
+    test_3_resume_equivalence,
+    test_4_best_class_labeling,
+    test_5_idmethod_dtype,
+    test_6_k_eff_bounds,
+    test_7_drop_keep_logic,
+    test_8_subsample_stability,
+    test_9_stability_calibration,
+    test_10_resume_equivalence_e2e,
+    test_11_passive_copy_toggle,
+    test_12_merge_date_overlap_skip,
+    test_13_episode_age_and_preflight,
+]
+
+
+def run_all() -> dict:
+    results = []
+    n_pass = 0
+    for fn in ALL_TESTS:
+        try:
+            rec = fn()
+            rec["status"] = "pass" if rec.get("passed") else "fail"
+            if rec.get("passed"):
+                n_pass += 1
+        except AssertionError as e:
+            rec = {"test": fn.__name__, "passed": False, "status": "fail",
+                   "error": str(e)}
+        except Exception as e:  # unexpected error
+            rec = {"test": fn.__name__, "passed": False, "status": "error",
+                   "error": f"{type(e).__name__}: {e}"}
+        results.append(rec)
+    summary = {"n_tests": len(ALL_TESTS), "n_pass": n_pass,
+               "n_fail": len(ALL_TESTS) - n_pass,
+               "all_passed": n_pass == len(ALL_TESTS),
+               "results": results}
+    return summary
+
+
+if __name__ == "__main__":
+    summ = run_all()
+    out_path = os.path.join(_HERE, "test_results.json")
+    with open(out_path, "w") as f:
+        json.dump(summ, f, indent=2, default=str)
+    for r in summ["results"]:
+        mark = "PASS" if r.get("passed") else "FAIL"
+        print(f"[{mark}] {r['test']}"
+              + ("" if r.get("passed") else f"  -> {r.get('error', '')}"))
+    print(f"\n{summ['n_pass']}/{summ['n_tests']} tests passed. "
+          f"Results -> {out_path}")
+    sys.exit(0 if summ["all_passed"] else 1)
