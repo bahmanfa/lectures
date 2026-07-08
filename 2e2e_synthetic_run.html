@@ -1,0 +1,170 @@
+"""
+End-to-end synthetic validation of part7_step1_regime_signal_analysis_v6.py.
+
+Builds a tiny synthetic regime-history CSV and a wide monthly returns CSV,
+points a research-mode CONFIG at them, runs run_all_v3 end-to-end, and asserts
+that all required validation artifacts are produced.
+"""
+from __future__ import annotations
+import os
+import sys
+import json
+import importlib.util
+import tempfile
+from copy import deepcopy
+
+import numpy as np
+import pandas as pd
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_MOD_PATH = os.path.join(os.path.dirname(_HERE), "build",
+                         "part7_step1_regime_signal_analysis_v6.py")
+
+spec = importlib.util.spec_from_file_location("regmod_e2e", _MOD_PATH)
+M = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(M)
+
+RNG = np.random.default_rng(20260708)
+
+STYLE_ASSETS = ["s_Momentum", "s_LowVol", "s_Quality", "s_Value", "s_Growth"]
+BENCH = "Bench_RF"
+
+
+def build_synthetic(tmp: str):
+    # ~12 years of month-ends -> plenty of obs for min_occurrences=12.
+    dates = pd.date_range("2010-01-31", "2021-12-31", freq="ME")
+    n = len(dates)
+
+    # ---- Regime history: several idmethods, a few states each ----
+    # Include leading-zero and non-numeric ids to exercise H3 canonicalization.
+    idmethods = ["001", "101", "202", "method_foo"]
+    reg_rows = []
+    for imid in idmethods:
+        # A slowly-switching state process (states 1,2,3).
+        state = 1
+        for dt in dates:
+            if RNG.random() < 0.08:          # ~8%/month switch prob
+                state = int(RNG.integers(1, 4))
+            reg_rows.append({
+                "idmethod": imid,
+                "date_eom": dt.strftime("%Y-%m-%d"),
+                "idstate": state,
+                "regime_label": f"state_{state}",
+            })
+    reg_df = pd.DataFrame(reg_rows)
+    reg_path = os.path.join(tmp, "synthetic_regime.csv")
+    reg_df.to_csv(reg_path, index=False)
+
+    # ---- Returns: wide monthly. Give ONE state a real edge to detect. ----
+    # Build a market factor + idiosyncratic noise per asset; add a small
+    # positive drift so some regime cells have significant forward returns.
+    mkt = 0.004 + 0.02 * RNG.standard_normal(n)
+    ret = {"date": dates.strftime("%Y-%m-%d")}
+    betas = {"s_Momentum": 1.1, "s_LowVol": 0.6, "s_Quality": 0.9,
+             "s_Value": 1.0, "s_Growth": 1.2}
+    for a in STYLE_ASSETS:
+        idio = 0.01 * RNG.standard_normal(n)
+        ret[a] = betas[a] * mkt + idio + 0.001
+    ret[BENCH] = 0.0015 + 0.0 * mkt          # low, near-constant risk-free
+    ret_df = pd.DataFrame(ret)
+    ret_path = os.path.join(tmp, "synthetic_returns.csv")
+    ret_df.to_csv(ret_path, index=False)
+    return reg_path, ret_path
+
+
+def make_cfg(reg_path, ret_path, out_folder):
+    cfg = deepcopy(M.CONFIG)
+    cfg["runtime"]["mode"] = "research"
+    cfg["io"]["identified_regime_csv"] = reg_path
+    cfg["io"]["asset_returns_csv"] = ret_path
+    cfg["io"]["output_folder"] = out_folder
+    cfg["io"]["resume"] = False
+    # Keep it fast + serial for determinism in the sandbox.
+    cfg["compute"]["n_jobs"] = 2
+    cfg["compute"]["subset_n_run_ids"] = None   # tiny universe already
+    cfg["compute"]["cleanup_shards"] = False
+    cfg["signal"]["rw_n_boot"] = 200
+    # min_occurrences kept at the contract default 12; widen the regime
+    # universe + cutoff so the tiny synthetic panel still yields testable cells.
+    cfg["signal"]["min_occurrences"] = 12
+    cfg["signal"]["baseline_cutoff_age"] = None       # keep full history
+    cfg["signal"]["regime_universe"] = "all"           # all regimes, not just last
+    # Lighten heavy steps but keep the full validation surface.
+    cfg["steps"]["run_romano_wolf_within"] = False
+    cfg["steps"]["run_romano_wolf_across"] = True
+    cfg["steps"]["run_subsample_stability"] = True
+    cfg["statistics"]["subsample_stability"]["n_bootstrap"] = 300
+    cfg["sample"]["pre_post_cutoff_date"] = "2016-06-30"
+    return cfg
+
+
+REQUIRED_ARTIFACTS = [
+    "validation_summary.json",
+    "human_readable_audit_report.md",
+    "panel_cardinality_report.csv",
+    "forward_return_diagnostics.csv",
+    "duplicate_policy_diagnostics.csv",
+    "subsample_stability_report.csv",
+    "k_eff_diagnostics.csv",
+    # v6.1: the sensitivity report is now a standing artifact (steps toggle
+    # run_sensitivity_report defaults True) and must be produced e2e.
+    "sensitivity_report.csv",
+]
+
+
+def main():
+    tmp = tempfile.mkdtemp(prefix="regv6_e2e_")
+    out_folder = os.path.join(tmp, "outputs")
+    reg_path, ret_path = build_synthetic(tmp)
+    cfg = make_cfg(reg_path, ret_path, out_folder)
+
+    print(f"Synthetic regime : {reg_path}")
+    print(f"Synthetic returns: {ret_path}")
+    print(f"Output folder    : {out_folder}")
+    print("Running run_all_v3 ...\n")
+
+    result = M.run_all_v3(cfg)
+
+    print("\n=== ARTIFACT CHECK ===")
+    missing = []
+    for art in REQUIRED_ARTIFACTS:
+        p = os.path.join(out_folder, art)
+        ok = os.path.exists(p)
+        sz = os.path.getsize(p) if ok else 0
+        print(f"  [{'OK ' if ok else 'MISS'}] {art} ({sz} bytes)")
+        if not ok:
+            missing.append(art)
+
+    vsum_path = os.path.join(out_folder, "validation_summary.json")
+    vsum = {}
+    if os.path.exists(vsum_path):
+        with open(vsum_path) as f:
+            vsum = json.load(f)
+        v = vsum.get("validation", {})
+        print("\n=== VALIDATION SUMMARY ===")
+        print(f"  mode          : {v.get('mode')}")
+        print(f"  n_checks      : {v.get('n_checks')}")
+        print(f"  n_pass        : {v.get('n_pass')}")
+        print(f"  n_warn        : {v.get('n_warn')}")
+        print(f"  n_fail        : {v.get('n_fail')}")
+        print(f"  has_blocking  : {v.get('has_blocking')}")
+        if v.get("blocking_errors"):
+            print(f"  blocking      : {v['blocking_errors']}")
+
+    ok_overall = (not missing
+                  and not vsum.get("validation", {}).get("has_blocking", True))
+    print(f"\nRESULT: {'PASS' if ok_overall else 'FAIL'}  "
+          f"(missing={missing})")
+    print(f"config_scores rows: "
+          f"{len(result.get('config_scores', [])) if hasattr(result.get('config_scores', []), '__len__') else 'n/a'}")
+    # Persist a machine-readable e2e result next to the tests.
+    with open(os.path.join(_HERE, "e2e_result.json"), "w") as f:
+        json.dump({"missing_artifacts": missing,
+                   "validation": vsum.get("validation", {}),
+                   "out_folder": out_folder,
+                   "passed": bool(ok_overall)}, f, indent=2, default=str)
+    return 0 if ok_overall else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

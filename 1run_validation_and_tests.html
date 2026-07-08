@@ -1,0 +1,101 @@
+"""
+Master validation harness [L7].
+
+Runs the 8 required unit tests + the end-to-end synthetic pipeline, then writes
+the combined evidence into the required audit artifacts inside the E2E output
+folder:
+    * test_audit.csv                  (one row per unit test)
+    * validation_summary.json         (augmented with a 'tests' block)
+    * human_readable_audit_report.md  (augmented with a Tests section)
+
+Usage:  python run_validation_and_tests.py
+"""
+from __future__ import annotations
+import os
+import json
+import sys
+
+import pandas as pd
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+
+import test_regime_signal_v6 as T   # noqa: E402
+import e2e_synthetic_run as E       # noqa: E402
+
+
+def main():
+    # ---- 1) Unit tests --------------------------------------------------
+    print("== Running 8 unit tests ==")
+    tsumm = T.run_all()
+    rows = []
+    for r in tsumm["results"]:
+        rows.append({
+            "test": r.get("test"),
+            "issue": r.get("issue", ""),
+            "status": r.get("status"),
+            "passed": bool(r.get("passed")),
+            "detail": json.dumps(r.get("detail", r.get("error", "")),
+                                 default=str),
+        })
+    audit_df = pd.DataFrame(rows)
+    for r in tsumm["results"]:
+        print(f"  [{'PASS' if r.get('passed') else 'FAIL'}] {r['test']}")
+    print(f"  -> {tsumm['n_pass']}/{tsumm['n_tests']} unit tests passed\n")
+
+    # ---- 2) End-to-end synthetic run -----------------------------------
+    print("== Running end-to-end synthetic pipeline ==")
+    e2e_rc = E.main()  # writes e2e_result.json + all artifacts
+    with open(os.path.join(_HERE, "e2e_result.json")) as f:
+        e2e = json.load(f)
+    out_folder = e2e["out_folder"]
+
+    # ---- 3) Wire test evidence into the audit artifacts ----------------
+    audit_csv = os.path.join(out_folder, "test_audit.csv")
+    audit_df.to_csv(audit_csv, index=False)
+    print(f"\nWrote {audit_csv}")
+
+    vpath = os.path.join(out_folder, "validation_summary.json")
+    if os.path.exists(vpath):
+        with open(vpath) as f:
+            vs = json.load(f)
+        vs["tests"] = {
+            "n_tests": tsumm["n_tests"],
+            "n_pass": tsumm["n_pass"],
+            "n_fail": tsumm["n_fail"],
+            "all_passed": tsumm["all_passed"],
+            "results": tsumm["results"],
+        }
+        with open(vpath, "w") as f:
+            json.dump(vs, f, indent=2, default=str)
+        print(f"Augmented {vpath} with tests block")
+
+    mdpath = os.path.join(out_folder, "human_readable_audit_report.md")
+    if os.path.exists(mdpath):
+        with open(mdpath, "a") as f:
+            f.write("\n## Unit tests (production-hardening contract)\n\n")
+            f.write(f"{tsumm['n_pass']}/{tsumm['n_tests']} tests passed.\n\n")
+            f.write("| Test | Issue | Status |\n|---|---|---|\n")
+            for r in tsumm["results"]:
+                badge = "PASS" if r.get("passed") else "FAIL"
+                f.write(f"| {r.get('test')} | {r.get('issue', '')} | "
+                        f"{badge} |\n")
+        print(f"Appended Tests section to {mdpath}")
+
+    overall = tsumm["all_passed"] and e2e.get("passed") and (e2e_rc == 0)
+    print(f"\n=== OVERALL: {'PASS' if overall else 'FAIL'} ===")
+    print(f"Output folder with all artifacts: {out_folder}")
+    # Copy the key artifacts to the workspace tests dir for sharing/inspection.
+    import shutil
+    dest = os.path.join(_HERE, "sample_artifacts")
+    os.makedirs(dest, exist_ok=True)
+    for art in (E.REQUIRED_ARTIFACTS + ["test_audit.csv"]):
+        src = os.path.join(out_folder, art)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(dest, art))
+    print(f"Copied artifacts to {dest}")
+    return 0 if overall else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

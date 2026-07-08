@@ -1,0 +1,13 @@
+axis,setting,n_significant_configs,n_sig_cells_bh,is_baseline,note
+headline_p_method,adjusted_min_p,2.0,,True,free: pre-stored headline variant
+headline_p_method,fisher_raw,4.0,,False,free: pre-stored headline variant
+headline_p_method,cauchy_combination,4.0,,False,free: pre-stored headline variant
+min_occurrences,6,,52.0,False,cell-level BH recount
+min_occurrences,12,,52.0,True,cell-level BH recount
+min_occurrences,18,,38.0,False,cell-level BH recount
+min_occurrences,24,,38.0,False,cell-level BH recount
+k_effective_method,raw_k,,,False,k=1.000
+k_effective_method,corrected_li_ji,,,True,k=1.000
+k_effective_method,galwey,,,False,k=1.000
+duplicate_policy,drop,4.0,,True,executed policy
+duplicate_policy,keep,,,False,counterfactual (see duplicate_policy_diagnostics.csv for grain impact)

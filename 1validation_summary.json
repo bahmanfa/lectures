@@ -1,0 +1,229 @@
+{
+  "context": {
+    "generated_at": "2026-07-08T16:26:47",
+    "pipeline_version": "6.0.0",
+    "sidecar_schema_version": "v6.0.0",
+    "runtime_mode": "research",
+    "manifest_hash": "3099e7eaca46de225138d3c946dfa1e3a10abceddc9ecd26b73b3d4adf02d882",
+    "config_hash": null,
+    "regime_file_hash": null,
+    "returns_file_hash": null,
+    "script_source_hash": "296adb74ec495ff1fec4321df3a13388fdb6e07aef7c00d8129a1055370feaa5",
+    "headline_p_method": "adjusted_min_p",
+    "k_effective_method": "corrected_li_ji",
+    "min_occurrences": 12,
+    "duplicate_policy": "drop",
+    "state_fill_policy": {
+      "use_ffilled_date_as_coverage_end_date": true,
+      "allow_post_coverage_ffill": false,
+      "max_ffill_months": 24,
+      "mark_stale_after_months": 6
+    },
+    "k_eff": 1.0,
+    "k_naive": 1,
+    "n_run_ids": 4,
+    "n_shards": 4,
+    "n_cells": 180,
+    "subsample_overall_pass": 0.24444444444444444
+  },
+  "validation": {
+    "mode": "research",
+    "pipeline_version": "6.0.0",
+    "n_checks": 15,
+    "n_pass": 15,
+    "n_fail": 0,
+    "n_warn": 0,
+    "has_blocking": false,
+    "checks": {
+      "config_validation": "pass",
+      "headline_p_method_check": "pass",
+      "k_effective_method_check": "pass",
+      "regime_schema": "pass",
+      "idmethod_dtype": "pass",
+      "date_validation_regime": "pass",
+      "regime_cardinality": "pass",
+      "panel_cardinality": "pass",
+      "date_validation_returns": "pass",
+      "returns_cardinality": "pass",
+      "k_effective": "pass",
+      "reg_slim_panel": "pass",
+      "duplicate_policy": "pass",
+      "cache_manifest": "pass",
+      "subsample_stability": "pass"
+    },
+    "details": {
+      "config_validation": {
+        "mode": "research",
+        "subset_n_run_ids": null
+      },
+      "headline_p_method_check": "adjusted_min_p",
+      "k_effective_method_check": "corrected_li_ji",
+      "regime_schema": [
+        "date_eom",
+        "idmethod",
+        "idstate"
+      ],
+      "idmethod_dtype": "string",
+      "date_validation_regime": {
+        "col": "date_eom",
+        "n_invalid": 0
+      },
+      "regime_cardinality": {
+        "grain": "idmethod+date_eom",
+        "duplicate_groups": 0
+      },
+      "panel_cardinality": {
+        "grain": [
+          "idmethod",
+          "date_eom"
+        ]
+      },
+      "date_validation_returns": {
+        "col": "date",
+        "n_invalid": 0
+      },
+      "returns_cardinality": {
+        "grain": [
+          "asset_class",
+          "asset_name",
+          "return_type",
+          "year_month"
+        ],
+        "duplicate_rows": 0
+      },
+      "k_effective": {
+        "k_eff": 1.0,
+        "k_raw": 1
+      },
+      "reg_slim_panel": {
+        "grain": [
+          "run_id",
+          "date_eom"
+        ]
+      },
+      "duplicate_policy": {
+        "duplicate_policy": "drop",
+        "dedupe_key_used": "idstate2,next_h_ym,idmethod,horizon,source_date_eom",
+        "n_before": 1728,
+        "n_after": 1728,
+        "n_removed": 0
+      },
+      "cache_manifest": {
+        "manifest_hash": "3099e7eaca46de225138d3c946dfa1e3a10abceddc9ecd26b73b3d4adf02d882",
+        "matched_prev": false
+      },
+      "subsample_stability": {
+        "overall_pass_frac": 0.24444444444444444
+      }
+    },
+    "blocking_errors": [],
+    "warnings": []
+  },
+  "tests": {
+    "n_tests": 8,
+    "n_pass": 8,
+    "n_fail": 0,
+    "all_passed": true,
+    "results": [
+      {
+        "test": "test_1_forward_return_correctness",
+        "issue": "C1",
+        "passed": true,
+        "detail": {
+          "feb_is_nan": true,
+          "jan->feb=2": true,
+          "apr->may=5": true,
+          "may_is_nan": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_2_panel_cardinality",
+        "issue": "H2/H5",
+        "passed": true,
+        "detail": {
+          "clean_pass": true,
+          "dup_flagged_fail": true,
+          "cardinality_report_written": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_3_resume_equivalence",
+        "issue": "C2/C3",
+        "passed": true,
+        "detail": {
+          "sidecar_roundtrip": true,
+          "rejects_stale_manifest": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_4_best_class_labeling",
+        "issue": "H1",
+        "passed": true,
+        "detail": {
+          "row0_best": "gamma",
+          "row1_best": "alpha",
+          "source_column_ok": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_5_idmethod_dtype",
+        "issue": "H3",
+        "passed": true,
+        "detail": {
+          "canonicalized": [
+            "001",
+            "101",
+            "101",
+            "101A",
+            "method_foo"
+          ],
+          "dtype": "string",
+          "guard_pass_on_string": true,
+          "guard_fail_on_numeric": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_6_k_eff_bounds",
+        "issue": "M1",
+        "passed": true,
+        "detail": {
+          "k_correlated": 2.0,
+          "k_independent": 3.0,
+          "k_raw_k_method": 3.0,
+          "bounds_1_to_kraw": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_7_drop_keep_logic",
+        "issue": "sample spec",
+        "passed": true,
+        "detail": {
+          "n_expanded": 6,
+          "drop_n_removed": 2,
+          "drop_dedupe_key": "idstate2,next_h_ym,idmethod,horizon,source_date_eom",
+          "keep_kept_all": true
+        },
+        "status": "pass"
+      },
+      {
+        "test": "test_8_subsample_stability",
+        "issue": "stability spec",
+        "passed": true,
+        "detail": {
+          "stable_formal_p": 0.368,
+          "unstable_formal_p": 0.001996007984031936,
+          "stable_pass": true,
+          "unstable_flagged_unstable": true,
+          "method": "moving_block_bootstrap"
+        },
+        "status": "pass"
+      }
+    ]
+  }
+}
